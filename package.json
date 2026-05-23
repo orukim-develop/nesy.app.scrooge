@@ -1,0 +1,7 @@
+{
+  "name": "nesy-app-scrooge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {}
+}
