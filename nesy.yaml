@@ -1,10 +1,18 @@
 tools:
   - name: setup_state
     description: |
-      사용자의 초기 재무 상태(자산 계좌, 부채, 저축 목표)를 한 번에 박는다.
-      처음 마도서를 쓸 때, 또는 "통장 하나 더 만들었어"처럼 새 계좌/부채를 추가할 때 호출. 같은 id 면 덮어쓴다.
-      goal.rationale 은 왜 그 금액/기한인지 사용자가 말한 근거 — 빠뜨리면 안 된다 (나중에 본인이 까먹어).
-      대부분의 사용자는 이미 "씹창난 통장"으로 시작하므로 과거 거래 마이그레이션 없이 오늘 시점 스냅샷만 받는 게 기본 — 사용자가 명시적으로 과거 import 를 요청하지 않는 한 reconcile_bank_statement 로 그때그때 넘기게 하면 된다.
+      초기 재무 상태(자산 계좌, 부채, 저축 목표)를 등록합니다.
+      처음 마도서를 쓸 때, 또는 새 계좌·부채를 추가할 때 호출하세요.
+
+      ★ 중요 — 동작 모델 ★
+      이 도구는 **현재 시점 잔액을 강제 덮어쓰기** 합니다.
+      - 같은 id 가 이미 존재하면 balance 가 그대로 덮어집니다. 거래 이력을 replay 하지 않습니다.
+      - 따라서 "5/1 시점 opening balance 박고 5월 거래로 누적시켜 현재 잔고 계산" 같은 모델은 작동하지 않습니다.
+      - 이미 등록된 계좌·부채의 잔고를 보정하고 싶다면 setup_state 를 다시 부르지 말고 update_entry 를 사용하세요.
+      - 일상 거래는 record_transaction 으로 — 그건 기존 잔고에 누적합니다.
+
+      goal.rationale 은 "왜 그 금액·기한인지" 의 메모입니다 — 반드시 받아두세요 (시간 지나면 본인도 잊습니다).
+      과거 거래 마이그레이션은 기본이 아닙니다 — 오늘 시점 스냅샷만 받고, 이후 거래는 record_transaction 으로 누적하거나 reconcile_bank_statement 로 한꺼번에 대조하세요.
     inputSchema:
       type: object
       properties:
@@ -19,7 +27,7 @@ tools:
           description: |
             부채 배열. 각 항목 { id, name, type, balance, due_date? }.
             type 는 card | loan | installment | overdraft.
-            balance 는 양수 정수 (얼마 빚이 있나).
+            balance 는 양수 정수 (얼마 빚이 있는지).
         goal:
           type: object
           description: |
@@ -28,14 +36,22 @@ tools:
 
   - name: record_transaction
     description: |
-      개별 거래 기록. "점심 만원 썼어", "월급 들어왔어", "통장에서 적금으로 30만원" 같은 말에 호출.
+      개별 거래 1건을 기록합니다. "점심 만원 썼어", "월급 들어왔어", "통장에서 적금으로 30만원" 같은 일상 거래 입력에 사용.
+
+      ★ 동작 모델 ★
+      거래 row 를 영구 저장하고, **그 1건의 효과를 기존 balance 에 누적**합니다. 잔고를 덮어쓰지 않습니다.
+      예: 마통 잔고가 5,891,672 일 때 expense from=마통, amount=10000 → 마통 잔고 5,901,672 (정확히 1만원 누적).
+
+      잔고 자체를 강제 조정해야 하는 경우 (마도서 잔고가 실제 통장과 어긋났을 때 등) 에는 가짜 거래를 박지 말고 update_entry 로 직접 balance 를 덮어쓰세요.
+
       type 별 처리:
-      - expense: 효용을 얻은 지출. 현금/체크는 from_account=자산id, 신용카드는 from_account=부채(카드)id 로 보내면 카드 미결제가 증가. 마통이 통장 본체인 경우 from_account=부채(마통)id 로 박으면 마통 빚 증가.
+      - expense: 효용을 얻은 지출. 현금·체크는 from_account=자산id, 신용카드는 from_account=부채(카드)id 로 보내면 카드 미결제가 증가. 마통이 통장 본체인 경우 from_account=부채(마통)id 로 박으면 마통 빚 증가.
       - income: 수입. to_account=자산id 가 기본. 마통이 통장 본체인 경우 to_account=부채(마통)id 로 박으면 빚 감소로 처리.
-      - transfer: 통장 간 단순 이동. 자산 이동이지 지출 아님. (자산 ↔ 자산만 가정 — 자산→부채는 card_payment 써라.)
-      - card_payment: 자산→부채 상환. 카드값 결제뿐 아니라 학자금/주담대/일반대출 갚을 때도 동일. from_account=자산(통장)id, to_account=부채(카드/대출)id. 지출로 잡지 않음 — 다른 가계부의 카드값 이중계상 버그를 막는 핵심.
+      - transfer: 통장 간 단순 이동. 자산 이동이지 지출이 아닙니다. (자산 ↔ 자산만 가정 — 자산→부채는 card_payment 를 사용하세요.)
+      - card_payment: 자산→부채 상환. 카드값 결제뿐 아니라 학자금·주담대·일반대출 갚을 때도 동일. from_account=자산(통장)id, to_account=부채(카드·대출)id. 지출로 잡지 않습니다 — 카드값 이중계상 방지의 핵심.
+
       카드 사용 시 "1000원 썼는데 할인받아서 950원만 승인됨" 같은 경우 amount=950, original_amount=1000.
-      expense 가 같은 카테고리 평균을 anomaly_threshold_ratio 배 이상 넘으면 자동으로 pending 큐(kind=anomaly)에 들어간다.
+      expense 가 같은 카테고리 평균을 anomaly_threshold_ratio 배 이상 넘으면 자동으로 pending 큐(kind=anomaly)에 들어갑니다.
     inputSchema:
       type: object
       properties:
@@ -44,7 +60,7 @@ tools:
           description: expense | income | transfer | card_payment
         amount:
           type: integer
-          description: 실제 결제 금액 (할인/취소 반영 후 최종). KRW 정수.
+          description: 실제 결제 금액 (할인·취소 반영 후 최종). KRW 정수.
         from_account:
           type: string
           description: 돈이 빠지는 계좌 id. expense/transfer/card_payment 일 때. income 은 비움.
@@ -68,9 +84,9 @@ tools:
 
   - name: record_voucher_use
     description: |
-      지역상품권/온누리상품권/문화상품권 등 별도 장부로 관리되는 바우처 사용 기록.
-      통장·카드와 분리된 장부에 들어가서 주된 자산·지출 계산을 오염시키지 않는다.
-      "지역상품권으로 만원 썼어" 같은 말에 호출.
+      지역상품권·온누리상품권·문화상품권 등 별도 장부로 관리되는 바우처 사용을 기록합니다.
+      통장·카드와 분리된 장부에 들어가므로 주된 자산·지출 계산을 오염시키지 않습니다.
+      "지역상품권으로 만원 썼어" 같은 입력에 호출.
     inputSchema:
       type: object
       properties:
@@ -90,11 +106,11 @@ tools:
 
   - name: reconcile_bank_statement
     description: |
-      사용자가 은행/카드 전체 명세를 한 번에 던지면 기존 기록과 대조한다. 사용자가 기록 안 한 거래는 누락 의심으로 잡고, 사용자가 기록한 금액과 실제 승인 금액이 다르면(예: 1000 적었지만 할인받아 950 승인) mismatch 큐에 넣어 보정 여부를 묻는다.
-      매칭 규칙: 같은 account_id 의 같은 흐름 방향(in/out), 날짜 ±1일, 금액 차이 5% 또는 50원 이내.
-      auto_add=true 면 누락 거래를 즉시 추가, false(기본) 면 pending 큐로 보내 사용자에게 확인.
-      raw 파일은 받지 않는다 — 호출 AI 가 사용자가 던진 명세서 사진/엑셀/문자를 파싱해서 transactions 배열로 넘긴다.
-      정확도 유지를 위해 사용자에게 "전체 거래내역 한 번 던져줘" 라고 정기적으로 잔소리하는 게 핵심.
+      사용자가 은행·카드 전체 명세를 한 번에 던지면 기존 기록과 대조합니다. 기록되지 않은 거래는 누락 의심으로 잡고, 기록된 금액과 실제 승인 금액이 다르면 (예: 1000 적었지만 할인 받아 950 승인) mismatch 큐에 넣어 보정 여부를 묻습니다.
+      매칭 규칙: 같은 account_id 의 같은 흐름 방향 (in/out), 날짜 ±1일, 금액 차이 5% 또는 50원 이내.
+      auto_add=true 면 누락 거래를 즉시 추가, false (기본) 면 pending 큐로 보내 사용자에게 확인.
+      raw 파일은 받지 않습니다 — 호출 AI 가 사용자가 제출한 명세서 사진·엑셀·문자를 파싱해서 transactions 배열로 넘기세요.
+      정확도 유지를 위해 사용자에게 정기적으로 "전체 거래 내역을 한 번 던져 달라" 고 안내하는 것이 핵심입니다.
     inputSchema:
       type: object
       properties:
@@ -103,7 +119,7 @@ tools:
           description: 신한카드, 국민은행 등 출처 설명.
         account_id:
           type: string
-          description: setup_state 에서 등록한 자산/부채 id.
+          description: setup_state 에서 등록한 자산·부채 id.
         period_start:
           type: string
           description: 명세 시작일 ISO.
@@ -114,7 +130,7 @@ tools:
           type: array
           description: |
             [{ date, amount, merchant, memo?, category?, type: expense|income|card_payment }] 형식.
-            type 는 그 명세 기준 흐름 — 카드 사용은 expense, 통장→카드 결제는 card_payment, 입금은 income.
+            type 는 해당 명세 기준 흐름 — 카드 사용은 expense, 통장→카드 결제는 card_payment, 입금은 income.
         auto_add:
           type: boolean
           description: 누락을 즉시 추가할지(true) 큐에 넣고 사용자에게 물을지(false, 기본).
@@ -122,12 +138,12 @@ tools:
 
   - name: resolve_pending
     description: |
-      get_state 가 돌려준 pending 항목(anomaly / missing_txn / amount_mismatch)에 사용자가 답할 때 호출.
+      get_state 가 돌려준 pending 항목 (anomaly / missing_txn / amount_mismatch) 에 사용자가 답할 때 호출.
       action:
-      - accept: 인정 (missing_txn → 거래 추가 + 잔고 조정, anomaly → 그냥 인정).
+      - accept: 인정 (missing_txn → 거래 추가 + 잔고 조정, anomaly → 그대로 인정).
       - correct: 보정 (amount_mismatch → corrected_amount 로 거래 금액 갱신 + 잔고 차액 보정).
       - ignore: 무시 (환불·잘못된 명세·이중기록).
-      - explain: 사용자 해명만 (answer 에 사유 텍스트 - anomaly 답변용).
+      - explain: 사용자 해명만 기록 (answer 에 사유 텍스트 — anomaly 답변용).
     inputSchema:
       type: object
       properties:
@@ -146,11 +162,13 @@ tools:
 
   - name: add_recurring
     description: |
-      정기 지출/수입 또는 sinking fund 등록.
+      정기 지출·수입 또는 sinking fund 를 등록합니다.
       kind=expense: 월세·통신비 같은 매월 고정비. 매월 예산에 자동 할당.
       kind=income: 월급 등 정기 수입.
-      kind=sinking_fund: 연 1회 자동차세, 분기별 보험, 명절 비용 같은 비정기 큰 지출 — annual_amount/12 만큼 매월 미리 할당해서 갑작스러운 큰 지출에 안 놀라게 함.
-      "쓸 수 있는 돈" = 자산 - 부채 - 할당분 — 이게 정확하려면 등록 필수.
+      kind=sinking_fund: 연 1회 자동차세, 분기별 보험, 명절 비용 같은 비정기 큰 지출 — annual_amount/12 만큼 매월 미리 할당해서 갑작스러운 큰 지출에 대비.
+      "쓸 수 있는 돈" = 자산 - 부채 - 할당분 — 이 계산이 정확하려면 등록이 필수입니다.
+
+      ※ 현재 자동 실행은 하지 않습니다 — 매월 실제 지출은 사용자가 record_transaction 으로 직접 기록해야 합니다. recurring 은 예산 할당 계획 (spendable 계산용) 으로만 사용됩니다.
     inputSchema:
       type: object
       properties:
@@ -176,18 +194,28 @@ tools:
 
   - name: update_entry
     description: |
-      이미 기록된 항목 수정. patch 에 든 필드만 갱신, 빠진 필드는 그대로 둔다.
-      entity_type:
-      - account: 자산 계좌 (잔고 변경은 가능하지만 신중하게 — 기존 거래와 어긋날 수 있음).
-      - debt: 부채.
-      - recurring: 정기/sinking fund. 월세 금액 바뀌었거나 헬스장 끊을 때.
-      - transaction: 개별 거래. 금액/계좌/타입 등 변경 시 자동으로 옛 잔고 영향 되돌리고 새 영향 다시 적용 — 잔고 일관성 유지된다.
-      - voucher_use: 바우처 사용. 금액 바뀌면 바우처 잔액 자동 보정.
-      - goal: 저축 목표 (전체 덮어쓰기는 setup_state 로도 가능).
+      이미 기록된 항목을 수정합니다. patch 에 든 필드만 갱신하고 빠진 필드는 그대로 둡니다.
 
-      transaction 수정 시 month (YYYY-MM, 거래 일자 기준) 가 필요하다 — 거래가 월별 폴더에 저장되기 때문.
-      voucher_use 수정 시 voucher_name 이 필요하다 — 저장 키가 voucher:{name}:{id} 라서.
-      goal 은 id 비워둔다 (단일 row).
+      ★ 동작 모델 ★
+      patch 의 값은 **그대로 덮어쓰기** 입니다. 누적이 아닙니다.
+      예: patch={balance: 5891672} → 기존 balance 가 무엇이었든 5,891,672 로 덮어씀.
+      거래 1건의 영향을 기존 잔고에 누적시키고 싶으면 update_entry 가 아니라 record_transaction 을 사용하세요.
+
+      주요 용도:
+      - **잔고 보정**: 마도서 balance 가 실제 통장과 어긋났을 때 patch={balance: 실잔액} 으로 직접 보정. setup_state 를 다시 부르지 말고 이걸 쓰세요.
+      - **항목 정보 수정**: 정기 항목 금액 변경, 거래 카테고리 정정 등.
+
+      entity_type:
+      - account: 자산 계좌 (잔고 변경 가능 — 잔고 보정의 기본 경로).
+      - debt: 부채 (잔고 변경 가능 — 마통·카드 미결제 보정의 기본 경로).
+      - recurring: 정기·sinking fund. 월세 금액이 바뀌었거나 헬스장을 끊었을 때.
+      - transaction: 개별 거래. 금액·계좌·타입 등 변경 시 자동으로 옛 잔고 영향을 되돌리고 새 영향을 다시 적용합니다 — 잔고 일관성이 유지됩니다.
+      - voucher_use: 바우처 사용. 금액이 바뀌면 바우처 잔액 자동 보정.
+      - goal: 저축 목표.
+
+      transaction 수정 시 month (YYYY-MM, 거래 일자 기준) 필요 — 거래가 월별 폴더에 저장되기 때문입니다.
+      voucher_use 수정 시 voucher_name 필요 — 저장 키가 voucher:{name}:{id} 라서.
+      goal 은 id 를 비웁니다 (단일 row).
     inputSchema:
       type: object
       properties:
@@ -199,7 +227,7 @@ tools:
           description: 대상 id. goal 은 비움.
         patch:
           type: object
-          description: 갱신할 필드 (예 transaction 면 { amount, category, memo }, recurring 면 { amount, name } 등).
+          description: 갱신할 필드 (예 debt 잔고 보정이면 { balance }, transaction 이면 { amount, category, memo }, recurring 이면 { amount, name } 등).
         month:
           type: string
           description: transaction 수정 시 그 거래의 YYYY-MM.
@@ -210,14 +238,14 @@ tools:
 
   - name: delete_entry
     description: |
-      이미 기록된 항목 삭제.
+      이미 기록된 항목을 삭제합니다.
       entity_type:
-      - transaction: 잔고 영향 자동 되돌림 (반대 방향 적용 후 삭제). 환불·이중기록·오타 등.
+      - transaction: 잔고 영향 자동 되돌림 (반대 방향 적용 후 삭제). 환불·이중기록·오타 등에 사용.
       - voucher_use: 바우처 잔액 복원 후 삭제.
       - recurring: 즉시 미래 할당에서 제외.
-      - account/debt: 단순 삭제. 그 계좌에 묶인 과거 거래의 잔고 정합성은 책임 안 짐 — 사용자가 결과 이해하고 호출해야.
-      - goal: 목표 포기/리셋. setup_state 로 새로 박는 게 더 흔한 흐름.
-      transaction 은 month, voucher_use 는 voucher_name 같이 필요.
+      - account/debt: 단순 삭제. 그 계좌에 묶인 과거 거래의 잔고 정합성은 보장하지 않습니다 — 결과를 이해하고 호출하세요.
+      - goal: 목표 포기/리셋.
+      transaction 은 month, voucher_use 는 voucher_name 이 같이 필요합니다.
     inputSchema:
       type: object
       properties:
@@ -237,25 +265,18 @@ tools:
 
   - name: get_state
     description: |
-      현재 재무 상태 전체 반환. 사용자에게 잔소리/조언/현황 설명 전에 항상 먼저 호출.
-
-      ★ 호출 AI 의 말투 지침 ★
-      이 마도서의 페르소나는 "스크루지" — 다음 톤을 반드시 유지한다:
-      1) 반말. "~다", "~해라", "~냐". 존댓말 금지.
-      2) 잔소리. 돈 새는 것에 민감한 구두쇠. "또 썼냐", "그래서 모이겠냐", "정신 차려라" 류 표현을 자연스럽게 섞는다.
-      3) 칭찬은 인색하게. 잘하고 있어도 "이번엔 봐줄 만하다", "방심하지 마라" 정도.
-      4) 결과 데이터의 nag 필드에 미리 만들어둔 스크루지의 한마디가 있으면 그대로 인용하거나 풀어 써도 좋다.
-      5) 사용자가 존댓말로 물어도 일관되게 반말. "오빠/언니" 같은 호칭 쓰지 않는다.
+      현재 재무 상태 전체를 반환합니다. 사용자에게 조언·현황 설명을 하기 전에 항상 먼저 호출하세요.
 
       반환 필드:
       - accounts, debts, net_worth, total_assets, total_debt
-      - allocations (정기+sinking 월간 할당), total_allocated, spendable (자산-부채-할당)
-      - goal (근거 포함), pace_vs_goal (월 얼마 모아야 도달, on_track 여부)
+      - allocations (정기+sinking 월간 할당), total_allocated, spendable (자산 - 부채 - 할당)
+      - goal (근거 포함), pace_vs_goal (월 얼마 모아야 도달하는지, on_track 여부)
       - this_month_summary (총수입·총지출·카테고리별)
-      - recurring (등록된 정기), pending (미해결 큐 — 반드시 사용자에게 알려서 처리 유도)
+      - recurring (등록된 정기), pending (미해결 큐 — 반드시 사용자에게 알려 처리 유도)
       - recent_transactions (최근 10건), voucher_balances ({바우처명: 잔액})
-      - nag (현재 상태를 스크루지 톤으로 미리 정리한 한두 줄)
-      month 로 다른 달 조회 가능 (생략 시 이번 달).
+      - nag (현재 상태에 대한 조언·경고를 1~3줄로 정리. nag_intensity 설정에 따라 강도 조절. 그대로 인용하거나 풀어 써도 됩니다.)
+
+      month 인자로 다른 달 조회 가능 (생략 시 이번 달).
     inputSchema:
       type: object
       properties:
@@ -277,15 +298,15 @@ user_settings:
     type: enum
     options: [부드럽게, 보통, 매섭게]
     default: 보통
-    description: 잔소리 강도 — 호출 AI 가 말투 결정할 때 참조
+    description: 조언·경고 강도. 호출 AI 가 nag 필드를 풀어 쓸 때 참고.
   - key: categories
     type: list_string
     default: [식비, 교통, 주거, 통신, 공과금, 카페, 쇼핑, 의료, 보험, 교육, 육아, 반려동물, 경조사, 문화, 여행, 미용, 기타]
-    description: 거래 카테고리 목록. 사용자 가구 구성(자가/월세, 자녀 유무, 반려동물 유무 등)에 따라 update_user_settings 로 자유롭게 편집.
+    description: 거래 카테고리 목록. 사용자 가구 구성 (자가·월세, 자녀 유무, 반려동물 유무 등) 에 따라 update_user_settings 로 자유롭게 편집.
   - key: anomaly_threshold_ratio
     type: number
     default: 2.0
-    description: 같은 카테고리 평균의 몇 배 넘으면 이상지출로 추궁할지
+    description: 같은 카테고리 평균의 몇 배를 넘으면 이상 지출로 표시할지
 
 notifications:
   function: daily_briefing

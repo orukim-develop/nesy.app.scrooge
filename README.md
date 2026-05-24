@@ -1,29 +1,42 @@
-# 스크루지가 잔소리하고 참견하는 마법
+# 가계부 마도서 (nesy.app.scrooge)
 
-반말로 사용자의 재정 상태를 참견하는 가계부 마도서. 호출 AI(Claude / ChatGPT)가 "스크루지" 또는 "Scrooge" 호출어로 발동시킨다.
+호출 AI(Claude / ChatGPT) 가 사용자의 자산 · 부채 · 거래 · 목표를 기록하고, 현재 재무 상태에 기반한 조언과 경고를 함께 돌려주는 가계부 마도서.
 
-## 페르소나
+분석이나 말투는 호출 AI 가 직접 한다. 마도서는 데이터 저장 · 잔고 계산 · 경고 신호 생성만 책임진다. 잔소리 강도는 `user_settings.nag_intensity` (부드럽게 / 보통 / 매섭게) 로 조절한다. `get_state` 응답의 `nag` 필드에 현재 상태에 맞춘 경고 1~3줄이 같이 나오니 그대로 인용하거나 풀어 써도 좋다.
 
-- **반말** — "~다", "~해라", "~냐". 존댓말 없음.
-- **잔소리** — 돈 새는 것에 민감한 구두쇠. "또 썼냐", "그래서 모이겠냐", "정신 차려라" 류의 표현.
-- **칭찬은 인색하게** — 잘하고 있어도 "이번엔 봐줄 만하다", "방심하지 마라" 정도.
+## 도구 (9개)
 
-호출 AI 가 이 톤을 일관되게 유지하도록 `get_state` 의 description 에 명시적 가이드가 들어 있고, 각 도구의 return text 도 미리 이 톤으로 깎여 있다. `get_state` 의 응답에는 `nag` 필드 — 현재 재무 상태에 맞춘 스크루지의 한마디 1~3줄 — 가 같이 나오니 그대로 인용하거나 풀어 써도 좋다. 잔소리 강도는 사용자가 user_settings 의 `nag_intensity`(부드럽게 / 보통 / 매섭게)로 조절한다.
+- `setup_state` — 초기 자산 / 부채 / 목표 스냅샷. **현재 시점 잔액을 강제 덮어쓰기** 합니다. 거래 누적 없이 그 자리에 박아 넣음. 잔고 보정용으로 다시 부르지 마세요.
+- `record_transaction` — 거래 1건을 저장하고 **기존 잔고에 누적**합니다. 4-type 모델 (expense / income / transfer / card_payment) 로 카드값 이중계상 차단.
+- `record_voucher_use` — 지역상품권 등 별도 장부.
+- `reconcile_bank_statement` — 사용자 기록 vs 실제 명세 대조, 할인 / 누락 보정.
+- `resolve_pending` — 이상지출 · 금액불일치 큐 처리.
+- `add_recurring` — 월 고정비 + sinking fund 할당.
+- `update_entry` — 전 entity_type 수정. **값을 그대로 덮어쓰기.** 잔고가 실제 통장과 어긋났을 때는 `setup_state` 가 아니라 이 도구로 직접 balance 를 보정합니다.
+- `delete_entry` — 전 entity_type 삭제. transaction 은 잔고 자동 역연산, voucher_use 는 바우처 잔액 자동 보정.
+- `get_state` — 통합 read. 조언 · 경고 전에 항상 호출. `nag` 필드 포함.
 
-## 핵심 도구
+### record_transaction vs update_entry — 헷갈리지 마세요
 
-- `setup_state` — 초기 자산/부채/목표 스냅샷 (목표는 근거 메모 필수)
-- `record_transaction` — 4-type 모델 (expense / income / transfer / card_payment) 로 카드값 이중계상 차단
-- `record_voucher_use` — 지역상품권 별도 장부
-- `reconcile_bank_statement` — 사용자 기록 vs 실제 명세 대조, 할인/누락 보정
-- `resolve_pending` — 이상지출·금액불일치 큐 처리
-- `add_recurring` — 월세·sinking fund 할당
-- `get_state` — 통합 read (잔소리 전에 항상 호출)
+| 상황 | 도구 | 동작 |
+|---|---|---|
+| 평소 거래 (도나쓰 만원 사 먹음) | `record_transaction` | 거래 row 저장 + 기존 잔고에 ±10,000 누적 |
+| 마도서 잔고가 실제 통장과 어긋남 (가짜 거래 박지 말고) | `update_entry` | `balance` 를 실잔액으로 직접 덮어쓰기 |
+| 초기 셋업 또는 전체 재구축 | `setup_state` | 계좌 · 부채 · 목표 일괄 덮어쓰기 |
 
-백그라운드: 매일 1회 `daily_briefing` 푸시, `/board` 위젯에 "스크루지의 한마디" + 카테고리 / 목표 / 미해결 표시.
+## 배경 함수
 
-**시크릿 없음** — 외부 API 호출 안 함. 분석·말투는 호출 AI 가 한다.
+- `daily_briefing` — 일 1회 푸시 알림 (현재 상태 요약).
+- `render_board` — 300초마다 위젯 갱신. `/board` 페이지에 "현재 상태 요약" + 카테고리 / 목표 / 미해결 표시.
+
+## 설계 원칙
+
+- **지출과 현금 흐름 분리** — 카드값 결제는 부채 상환이지 지출이 아님. `card_payment` 타입으로 처리.
+- **자동 수집 불가** — MCP request-response 구조. 사용자가 호출 AI 에 명세서를 던지면 AI 가 파싱해서 `reconcile_bank_statement` 로 넘김.
+- **마통 (마이너스통장) 처리** — 마통은 부채로 등록 후 거래의 `from` / `to` 를 그 부채 id 로 박음. `income` 의 `to_account` 가 부채면 자동으로 빚 감소 처리. `card_payment` 는 카드값 전용이 아니라 자산 → 부채 상환 일반에 사용 (학자금 / 주담대 포함).
+
+**시크릿 없음** — 외부 API 호출 안 함.
 
 ## 배포
 
-이 리포 기본 브랜치에 푸시 → nesy.app 도구 편집 화면에서 리포 연결 → "지금 가져오기" 클릭. user_settings(통화·잔소리 강도·이상지출 임계 등)는 nesy.app UI 에서 사용자가 직접 조정한다.
+이 리포 기본 브랜치에 푸시 → nesy.app 도구 편집 화면에서 리포 연결 → "지금 가져오기" 클릭. `user_settings` (통화 · 잔소리 강도 · 이상지출 임계 등) 는 nesy.app UI 에서 사용자가 직접 조정한다.
