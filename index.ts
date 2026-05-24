@@ -881,12 +881,56 @@ async function renderBoard(args: any, data: DataAPI) {
     .map(([c, v]) => `<tr><td>${escapeHtml(c)}</td><td style="text-align:right">${fmt(v as number)}</td></tr>`)
     .join('');
 
+  const p = state.pace_vs_goal;
   const goalBlock = state.goal ? `
     <div><strong>목표</strong> ${fmt(state.goal.amount)} by ${state.goal.deadline}
     <br><small style="color:#888">${escapeHtml(state.goal.rationale || '')}</small>
     <br>순자산 ${fmt(state.net_worth)} (${Math.round((state.net_worth / state.goal.amount) * 100)}%)
-    ${state.pace_vs_goal ? `<br><small style="color:${state.pace_vs_goal.on_track ? '#7c7' : '#e77'}">${state.pace_vs_goal.on_track ? '✓ 페이스 OK' : `✗ 월 ${fmt(state.pace_vs_goal.needed_per_month)}원 추가 저축 필요`}</small>` : ''}
+    ${p ? `<br><small style="color:${p.cumulative_on_track ? '#7c7' : '#e77'}">${p.cumulative_on_track ? '✓ 누적 진척 OK' : `✗ 누적 진척 미달 (월 ${fmt(p.needed_per_month)}원 페이스 필요)`}</small>` : ''}
     </div>` : '<div style="color:#888">목표 미설정.</div>';
+
+  const fc = state.month_forecast;
+  const forecastBlock = fc ? (() => {
+    const projPl = fc.projected_month_end_pl;
+    const projColor = projPl >= 0 ? '#7c7' : '#e77';
+    const needed = p?.needed_per_month ?? 0;
+    const paceLine = p ? (
+      p.month_on_track
+        ? `<span style="color:#7c7">✓ 목표 페이스 ${fmt(needed)}원 충족 (여유 ${fmt(-p.month_shortfall)}원)</span>`
+        : `<span style="color:#e77">✗ 목표 페이스 ${fmt(needed)}원에 ${fmt(p.month_shortfall)}원 부족</span>`
+    ) : '';
+    const upcomingRows = (fc.upcoming_recurring || [])
+      .sort((a: any, b: any) => (a.day_of_month ?? 99) - (b.day_of_month ?? 99))
+      .map((u: any) => {
+        const day = u.day_of_month ? `${u.day_of_month}일` : '날짜미정';
+        const sign = u.kind === 'income' ? '+' : '−';
+        const est = u.estimated ? ` <small style="color:#888">(추정, 정가 ${fmt(u.base_amount)})</small>` : '';
+        return `<tr><td style="color:#888;width:50px">${day}</td><td>${escapeHtml(u.name)}${est}</td><td style="text-align:right">${sign}${fmt(u.amount)}</td></tr>`;
+      }).join('');
+    const sfLine = fc.sinking_fund_monthly_commit > 0
+      ? `<tr><td style="color:#888">매월</td><td>sinking_fund 합 <small style="color:#888">(연 ${fmt(fc.sinking_fund_annual_total)}원의 1/12)</small></td><td style="text-align:right">−${fmt(fc.sinking_fund_monthly_commit)}</td></tr>`
+      : '';
+    const notesBlock = (fc.estimation_notes || []).length
+      ? `<div style="font-size:11px;color:#c8a85a;margin-top:8px;line-height:1.5">${fc.estimation_notes.map((n: string) => `⚠ ${escapeHtml(n)}`).join('<br>')}</div>`
+      : '';
+    return `
+    <div class="col" style="margin-bottom:12px">
+      <h2>이번 달 예측 (D-${fc.days_remaining})</h2>
+      <div style="font-size:12px;color:#aaa;margin-bottom:6px">
+        현재 P&L ${fmt(state.this_month_summary.current_month_pl)}원
+        ${fc.projected_inflow > 0 ? ` + 예상 수입 ${fmt(fc.projected_inflow)}원` : ''}
+        − 예상 지출 ${fmt(fc.projected_outflow)}원
+      </div>
+      <div class="big" style="color:${projColor}">${projPl >= 0 ? '+' : ''}${fmt(projPl)}</div>
+      <div style="font-size:12px;margin-top:4px">${paceLine}</div>
+      ${(upcomingRows || sfLine) ? `
+      <details style="margin-top:10px">
+        <summary style="cursor:pointer;font-size:12px;color:#888">남은 정기 항목 ${(fc.upcoming_recurring || []).length}건 ${fc.sinking_fund_monthly_commit > 0 ? '+ sinking_fund' : ''}</summary>
+        <table style="margin-top:6px">${upcomingRows}${sfLine}</table>
+      </details>` : ''}
+      ${notesBlock}
+    </div>`;
+  })() : '';
 
   const pendingBlock = state.pending?.length ? `
     <div style="background:#3a2020;padding:8px;border-radius:6px;margin-bottom:12px">
@@ -922,9 +966,10 @@ ${nagBlock}
 <div class="row">
   <div class="col"><h2>쓸 수 있는 돈</h2><div class="big">${fmt(state.spendable)}</div>
     <small style="color:#888">자산 ${fmt(state.total_assets)} − 부채 ${fmt(state.total_debt)} − 할당 ${fmt(state.total_allocated)}</small></div>
-  <div class="col"><h2>이번 달 지출</h2><div class="big">${fmt(state.this_month_summary?.total_expense || 0)}</div>
-    <small style="color:#888">수입 ${fmt(state.this_month_summary?.total_income || 0)}</small></div>
+  <div class="col"><h2>이번 달 P&amp;L (발생주의)</h2><div class="big">${(state.this_month_summary?.current_month_pl ?? 0) >= 0 ? '+' : ''}${fmt(state.this_month_summary?.current_month_pl || 0)}</div>
+    <small style="color:#888">수입 ${fmt(state.this_month_summary?.total_income || 0)} / 지출 ${fmt(state.this_month_summary?.total_expense || 0)}${state.this_month_summary?.total_card_payment ? `<br>카드값 결제 ${fmt(state.this_month_summary.total_card_payment)} <span style="color:#666">(P&amp;L 무관)</span>` : ''}</small></div>
 </div>
+${forecastBlock}
 <div class="col" style="margin-bottom:12px">${goalBlock}</div>
 ${pendingBlock}
 <h2>카테고리별</h2>
