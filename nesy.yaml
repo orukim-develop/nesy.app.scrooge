@@ -174,6 +174,67 @@ tools:
           type: string
       required: [name, amount, kind]
 
+  - name: update_entry
+    description: |
+      이미 기록된 항목 수정. patch 에 든 필드만 갱신, 빠진 필드는 그대로 둔다.
+      entity_type:
+      - account: 자산 계좌 (잔고 변경은 가능하지만 신중하게 — 기존 거래와 어긋날 수 있음).
+      - debt: 부채.
+      - recurring: 정기/sinking fund. 월세 금액 바뀌었거나 헬스장 끊을 때.
+      - transaction: 개별 거래. 금액/계좌/타입 등 변경 시 자동으로 옛 잔고 영향 되돌리고 새 영향 다시 적용 — 잔고 일관성 유지된다.
+      - voucher_use: 바우처 사용. 금액 바뀌면 바우처 잔액 자동 보정.
+      - goal: 저축 목표 (전체 덮어쓰기는 setup_state 로도 가능).
+
+      transaction 수정 시 month (YYYY-MM, 거래 일자 기준) 가 필요하다 — 거래가 월별 폴더에 저장되기 때문.
+      voucher_use 수정 시 voucher_name 이 필요하다 — 저장 키가 voucher:{name}:{id} 라서.
+      goal 은 id 비워둔다 (단일 row).
+    inputSchema:
+      type: object
+      properties:
+        entity_type:
+          type: string
+          description: account | debt | recurring | transaction | voucher_use | goal
+        id:
+          type: string
+          description: 대상 id. goal 은 비움.
+        patch:
+          type: object
+          description: 갱신할 필드 (예 transaction 면 { amount, category, memo }, recurring 면 { amount, name } 등).
+        month:
+          type: string
+          description: transaction 수정 시 그 거래의 YYYY-MM.
+        voucher_name:
+          type: string
+          description: voucher_use 수정 시 필요.
+      required: [entity_type, patch]
+
+  - name: delete_entry
+    description: |
+      이미 기록된 항목 삭제.
+      entity_type:
+      - transaction: 잔고 영향 자동 되돌림 (반대 방향 적용 후 삭제). 환불·이중기록·오타 등.
+      - voucher_use: 바우처 잔액 복원 후 삭제.
+      - recurring: 즉시 미래 할당에서 제외.
+      - account/debt: 단순 삭제. 그 계좌에 묶인 과거 거래의 잔고 정합성은 책임 안 짐 — 사용자가 결과 이해하고 호출해야.
+      - goal: 목표 포기/리셋. setup_state 로 새로 박는 게 더 흔한 흐름.
+      transaction 은 month, voucher_use 는 voucher_name 같이 필요.
+    inputSchema:
+      type: object
+      properties:
+        entity_type:
+          type: string
+          description: account | debt | recurring | transaction | voucher_use | goal
+        id:
+          type: string
+          description: goal 은 비움.
+        month:
+          type: string
+          description: transaction 삭제 시 필요.
+        voucher_name:
+          type: string
+          description: voucher_use 삭제 시 필요.
+      required: [entity_type]
+
   - name: get_state
     description: |
       현재 재무 상태 전체 반환. 사용자에게 잔소리/조언/현황 설명 전에 항상 먼저 호출.

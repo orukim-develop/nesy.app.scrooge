@@ -45,6 +45,8 @@ export async function run({ input, data }: {
     case 'reconcile_bank_statement': return reconcileBankStatement(args, data);
     case 'resolve_pending': return resolvePending(args, data);
     case 'add_recurring': return addRecurring(args, data);
+    case 'update_entry': return updateEntry(args, data);
+    case 'delete_entry': return deleteEntry(args, data);
     case 'get_state': return getState(args, data);
     case 'daily_briefing': return dailyBriefing(data);
     case 'render_board': return renderBoard(args, data);
@@ -415,6 +417,171 @@ async function addRecurring(args: any, data: DataAPI) {
     ? `연 ${fmt(amount)}원이면 매월 ${fmt(amount / 12)}원씩 미리 떼어놓겠다. 그래야 갑자기 큰 지출에 안 놀란다.`
     : kind === 'expense' ? `매월 ${fmt(amount)}원 할당이다.` : `월 ${fmt(amount)}원 수입으로 잡았다.`;
   return { text: `${name} 등록. ${tail}`, id };
+}
+
+// 거래의 잔고 영향을 적용/되돌리기 위한 단일 진입점. sign=+1 적용, sign=-1 되돌림.
+async function applyTxnBalance(data: DataAPI, txn: Transaction, sign: 1 | -1) {
+  const amt = txn.amount * sign;
+  if (txn.type === 'expense') {
+    if (txn.from_account) {
+      const found = await loadAccountOrDebt(data, txn.from_account);
+      if (found?.kind === 'debt') await adjustBalance(data, txn.from_account, +amt);
+      else await adjustBalance(data, txn.from_account, -amt);
+    }
+  } else if (txn.type === 'income') {
+    if (txn.to_account) await adjustBalance(data, txn.to_account, +amt);
+  } else if (txn.type === 'transfer') {
+    if (txn.from_account) await adjustBalance(data, txn.from_account, -amt);
+    if (txn.to_account) await adjustBalance(data, txn.to_account, +amt);
+  } else if (txn.type === 'card_payment') {
+    if (txn.from_account) await adjustBalance(data, txn.from_account, -amt);
+    if (txn.to_account) await adjustBalance(data, txn.to_account, -amt);
+  }
+}
+
+async function updateEntry(args: any, data: DataAPI) {
+  const entityType = args.entity_type as string;
+  const id = args.id as string | undefined;
+  const patch = (args.patch || {}) as Record<string, any>;
+  if (!entityType) throw new Error('entity_type 필요하다.');
+  if (!patch || Object.keys(patch).length === 0) throw new Error('patch 가 비었다. 뭘 고치라는 거냐.');
+
+  if (entityType === 'goal') {
+    const cur = (await data.get('goal')) as Goal | null;
+    if (!cur) throw new Error('goal 없다. setup_state 로 먼저 박아라.');
+    const next = { ...cur, ...patch };
+    await data.set('goal', next);
+    return { text: `목표 갱신했다. ${fmt(next.amount)}원 by ${next.deadline}.`, entity: next };
+  }
+
+  if (!id) throw new Error(`${entityType} 수정은 id 필요하다.`);
+
+  if (entityType === 'account' || entityType === 'debt') {
+    const key = `${entityType}:${id}`;
+    const cur = await data.get(key);
+    if (!cur) throw new Error(`${key} 없다.`);
+    const next = { ...cur, ...patch };
+    if (patch.balance !== undefined) next.balance = Number(patch.balance);
+    await data.set(key, next);
+    return { text: `${next.name || id} 갱신했다.`, entity: next };
+  }
+
+  if (entityType === 'recurring') {
+    const key = `recurring:${id}`;
+    const cur = await data.get(key);
+    if (!cur) throw new Error(`${key} 없다.`);
+    const next = { ...cur, ...patch };
+    if (patch.amount !== undefined) next.amount = Number(patch.amount);
+    await data.set(key, next);
+    return { text: `${next.name || id} 정기 항목 갱신.`, entity: next };
+  }
+
+  if (entityType === 'transaction') {
+    const month = args.month as string;
+    if (!month) throw new Error('transaction 수정은 month (YYYY-MM) 필요하다.');
+    const key = `txn:${month}:${id}`;
+    const cur = (await data.get(key)) as Transaction | null;
+    if (!cur) throw new Error(`${key} 없다.`);
+    // 옛 영향 되돌리고
+    await applyTxnBalance(data, cur, -1);
+    const next: Transaction = { ...cur, ...patch };
+    if (patch.amount !== undefined) next.amount = Number(patch.amount);
+    if (patch.original_amount !== undefined) next.original_amount = Number(patch.original_amount);
+    // 날짜가 바뀌면 월별 키도 옮긴다
+    const newMonth = (next.date || cur.date).slice(0, 7);
+    if (newMonth !== month) {
+      await data.delete(key);
+      await data.set(`txn:${newMonth}:${id}`, next);
+    } else {
+      await data.set(key, next);
+    }
+    // 새 영향 다시 적용
+    await applyTxnBalance(data, next, +1);
+    return { text: `거래 ${id} 갱신했다. ${fmt(next.amount)}원. 잔고 자동 보정.`, entity: next };
+  }
+
+  if (entityType === 'voucher_use') {
+    const voucherName = args.voucher_name as string;
+    if (!voucherName) throw new Error('voucher_use 수정은 voucher_name 필요하다.');
+    const key = `voucher:${voucherName}:${id}`;
+    const cur = await data.get(key);
+    if (!cur) throw new Error(`${key} 없다.`);
+    const oldAmount = Number(cur.amount_used);
+    const next = { ...cur, ...patch };
+    if (patch.amount_used !== undefined) next.amount_used = Number(patch.amount_used);
+    await data.set(key, next);
+    // 바우처 잔액 보정: 옛 금액 복원 + 새 금액 차감 = +oldAmount - newAmount
+    const delta = oldAmount - Number(next.amount_used);
+    if (delta !== 0) {
+      const balKey = `voucher_balance:${voucherName}`;
+      const bal = (await data.get(balKey)) as { balance: number } | null;
+      const newBal = (bal?.balance ?? 0) + delta;
+      await data.set(balKey, { balance: newBal });
+    }
+    return { text: `${voucherName} 사용 기록 갱신. 잔액도 보정.`, entity: next };
+  }
+
+  throw new Error(`알 수 없는 entity_type: ${entityType}`);
+}
+
+async function deleteEntry(args: any, data: DataAPI) {
+  const entityType = args.entity_type as string;
+  const id = args.id as string | undefined;
+  if (!entityType) throw new Error('entity_type 필요하다.');
+
+  if (entityType === 'goal') {
+    const ok = await data.delete('goal');
+    return { text: ok ? '목표 지웠다. 뭐 위해 모으냐 이젠.' : '목표 없는데 뭘 지우냐.', deleted: ok };
+  }
+
+  if (!id) throw new Error(`${entityType} 삭제는 id 필요하다.`);
+
+  if (entityType === 'account' || entityType === 'debt') {
+    const key = `${entityType}:${id}`;
+    const ok = await data.delete(key);
+    return {
+      text: ok
+        ? `${key} 지웠다. 묶인 과거 거래의 잔고 정합성은 본인 책임이다.`
+        : `${key} 없다.`,
+      deleted: ok,
+    };
+  }
+
+  if (entityType === 'recurring') {
+    const key = `recurring:${id}`;
+    const ok = await data.delete(key);
+    return {
+      text: ok ? `정기 항목 ${id} 지웠다. 다음부터 할당 안 잡힌다.` : `recurring:${id} 없다.`,
+      deleted: ok,
+    };
+  }
+
+  if (entityType === 'transaction') {
+    const month = args.month as string;
+    if (!month) throw new Error('transaction 삭제는 month (YYYY-MM) 필요하다.');
+    const key = `txn:${month}:${id}`;
+    const cur = (await data.get(key)) as Transaction | null;
+    if (!cur) return { text: `${key} 없다.`, deleted: false };
+    await applyTxnBalance(data, cur, -1);
+    await data.delete(key);
+    return { text: `거래 ${id} (${fmt(cur.amount)}원) 지웠고 잔고 되돌렸다.`, deleted: true };
+  }
+
+  if (entityType === 'voucher_use') {
+    const voucherName = args.voucher_name as string;
+    if (!voucherName) throw new Error('voucher_use 삭제는 voucher_name 필요하다.');
+    const key = `voucher:${voucherName}:${id}`;
+    const cur = await data.get(key);
+    if (!cur) return { text: `${key} 없다.`, deleted: false };
+    const amt = Number(cur.amount_used);
+    const balKey = `voucher_balance:${voucherName}`;
+    const bal = (await data.get(balKey)) as { balance: number } | null;
+    await data.set(balKey, { balance: (bal?.balance ?? 0) + amt });
+    await data.delete(key);
+    return { text: `${voucherName} 사용 ${fmt(amt)}원 취소. 잔액 복원했다.`, deleted: true };
+  }
+
+  throw new Error(`알 수 없는 entity_type: ${entityType}`);
 }
 
 function scroogeNag(state: any, intensity: string): string[] {
