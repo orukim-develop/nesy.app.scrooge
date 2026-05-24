@@ -24,6 +24,29 @@
 | 마도서 잔고가 실제 통장과 어긋남 (가짜 거래 박지 말고) | `update_entry` | `balance` 를 실잔액으로 직접 덮어쓰기 |
 | 초기 셋업 또는 전체 재구축 | `setup_state` | 계좌 · 부채 · 목표 일괄 덮어쓰기 |
 
+## 월 페이스 판단 — projection 기반
+
+호출 AI 가 "이번 달 흑자/적자, 목표 페이스 OK?" 를 판단할 때 현재 시점 snapshot 만 보면 안 된다. 남은 일수에 빠질 정기 지출 (월세, 차량할부, 관리비, 통신비 …) 을 빼먹는다. `get_state` 의 `month_forecast` 와 `pace_vs_goal.month_on_track` 을 반드시 사용.
+
+```
+get_state 응답에서 페이스 판단에 쓰는 필드:
+  pace_vs_goal.month_on_track       ← 이걸 본다
+  pace_vs_goal.projected_month_pl   ← 이번 달 최종 예상 net
+  pace_vs_goal.month_shortfall      ← 부족분 (양수 = 부족)
+  month_forecast.upcoming_recurring ← 아직 안 빠진 정기 항목 (이 달 며칠에 얼마)
+  month_forecast.sinking_fund_monthly_commit ← 약속된 sinking_fund 차감
+```
+
+**발생주의 vs 현금주의**: `total_expense` 와 `current_month_pl` 은 새로 발생한 지출 기준 (발생주의). `total_card_payment` 는 이전 달 지출의 정산이라 P&L 영향 없음 — 페이스에 합산하지 마라. 마도서가 이미 별도 필드로 분리해서 돌려준다.
+
+## recurring_id 워크플로 — month_forecast 정확도
+
+`record_transaction` 시 이 거래가 등록된 정기 항목의 이번 달 인스턴스라면 `recurring_id` 를 채워라. 그래야 `month_forecast` 가 "이미 처리됨" 판정해서 같은 항목을 또 차감하지 않는다.
+
+- `add_recurring` 호출 시 반환된 id 를 기억
+- 사용자가 "월세 빠졌어" 하면 → `get_state.recurring` 배열에서 "LH 월세" 의 id 찾기 → `record_transaction(..., recurring_id: 그_id)`
+- `day_of_month` 가 채워져 있으면 정확한 날짜 기반 예측. 비어 있으면 비례 배분 추정 (`estimation_notes` 에 안내가 나옴 — 사용자에게 정확한 날짜 물어봐서 `update_entry` 로 채워라)
+
 ## 배경 함수
 
 - `daily_briefing` — 일 1회 푸시 알림 (현재 상태 요약).

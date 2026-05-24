@@ -10,6 +10,7 @@ type Transaction = {
   amount: number; from_account?: string; to_account?: string;
   category?: string; merchant?: string; memo?: string;
   original_amount?: number; date: string; created_at: string;
+  recurring_id?: string;  // 이 거래가 어떤 recurring 의 이번 달 인스턴스인지. month_forecast 가 "이미 처리됨" 판정에 사용.
 };
 type Pending = {
   id: string; kind: 'anomaly' | 'missing_txn' | 'amount_mismatch';
@@ -105,6 +106,7 @@ async function recordTransaction(args: any, data: DataAPI) {
     original_amount: args.original_amount ? Number(args.original_amount) : undefined,
     date,
     created_at: now(),
+    recurring_id: args.recurring_id || undefined,
   };
 
   await data.set(`txn:${ym}:${id}`, txn);
@@ -594,16 +596,41 @@ function scroogeNag(state: any, intensity: string): string[] {
       : soft ? `쓸 수 있는 돈이 ${fmt(Math.abs(state.spendable))}원 부족합니다.`
       : `쓸 수 있는 돈이 ${fmt(Math.abs(state.spendable))}원 부족합니다. 조정이 필요합니다.`);
   }
-  if (state.pace_vs_goal && !state.pace_vs_goal.on_track) {
-    lines.push(`목표 페이스 미달 — 월 ${fmt(state.pace_vs_goal.needed_per_month)}원을 저축해야 도달합니다.`);
+
+  // 월 페이스 경고 — 반드시 projection 기반.
+  const p = state.pace_vs_goal;
+  const fc = state.month_forecast;
+  if (p && p.month_on_track === false) {
+    const shortfall = p.month_shortfall;
+    const sfNote = fc && fc.sinking_fund_monthly_commit > 0
+      ? ` (sinking_fund 월 ${fmt(fc.sinking_fund_monthly_commit)}원 [연 ${fmt(fc.sinking_fund_annual_total)}원의 1/12] 약속 지출로 포함)`
+      : '';
+    lines.push(
+      `이번 달 예상 최종 net ${fmt(p.projected_month_pl)}원${sfNote}. 목표 페이스 ${fmt(p.needed_per_month)}원에 ${fmt(shortfall)}원 부족. 남은 ${fc?.days_remaining ?? '?'}일 조정 필요.`
+    );
+  } else if (p && p.month_on_track === true && fc) {
+    const sfNote = fc.sinking_fund_monthly_commit > 0
+      ? ` (sinking_fund 월 ${fmt(fc.sinking_fund_monthly_commit)}원 [연 ${fmt(fc.sinking_fund_annual_total)}원의 1/12] 차감 후)`
+      : '';
+    lines.push(`이번 달 예상 최종 net ${fmt(p.projected_month_pl)}원, 목표 페이스 ${fmt(p.needed_per_month)}원 충족${sfNote}.`);
   }
+  if (p && p.cumulative_on_track === false) {
+    lines.push(`누적 진척이 일정 대비 미달. 현재 순자산 ${fmt(p.current_net_worth)}원, 목표 ${fmt(state.goal?.amount ?? 0)}원.`);
+  }
+
+  // 예측 추정 안내.
+  if (fc?.estimation_notes?.length) {
+    for (const note of fc.estimation_notes) lines.push(note);
+  }
+
   const pending = state.pending?.length || 0;
   if (pending > 0) lines.push(`미해결 항목 ${pending}건이 처리 대기 중입니다.`);
 
   const exp = state.this_month_summary?.total_expense || 0;
   const inc = state.this_month_summary?.total_income || 0;
+  const cp = state.this_month_summary?.total_card_payment || 0;
   if (inc > 0 && exp > inc) {
-    lines.push(`이번 달 ${fmt(exp - inc)}원 적자입니다.`);
+    lines.push(`이번 달 발생주의 적자 ${fmt(exp - inc)}원 (지출 ${fmt(exp)} 대 수입 ${fmt(inc)}). 카드값 결제 ${fmt(cp)}원은 P&L 무관 — 별도.`);
   }
 
   const cats = state.this_month_summary?.by_category || {};
@@ -622,6 +649,7 @@ function scroogeNag(state: any, intensity: string): string[] {
 
 async function getState(args: any, data: DataAPI) {
   const month = (args.month as string) || thisMonth();
+  const isCurrentMonth = month === thisMonth();
 
   const [accounts, debts, recurrings, pendings, voucherBalances, goalRaw, monthTxns, settingsRaw] = await Promise.all([
     data.list('account:'),
@@ -636,24 +664,34 @@ async function getState(args: any, data: DataAPI) {
 
   const allTxns = monthTxns.map(r => r.value as Transaction).filter(Boolean);
 
+  // P&L 집계 — 발생주의. card_payment 는 P&L 영향 없음, 별도 노출.
   const byCategory: Record<string, number> = {};
-  let totalExpense = 0, totalIncome = 0;
+  let totalExpense = 0, totalIncome = 0, totalCardPayment = 0;
   for (const t of allTxns) {
     if (t.type === 'expense') {
       totalExpense += t.amount;
       const c = t.category || '미분류';
       byCategory[c] = (byCategory[c] || 0) + t.amount;
-    } else if (t.type === 'income') totalIncome += t.amount;
+    } else if (t.type === 'income') {
+      totalIncome += t.amount;
+    } else if (t.type === 'card_payment') {
+      totalCardPayment += t.amount;
+    }
   }
+  const currentMonthPl = totalIncome - totalExpense;
 
   const recurringItems = recurrings.map(r => r.value as Recurring).filter(Boolean);
   const allocations: Array<{ name: string; monthly: number; kind: string }> = [];
   let totalAllocated = 0;
+  let sinkingFundMonthlyCommit = 0;
+  let sinkingFundAnnualTotal = 0;
   for (const r of recurringItems) {
     if (r.kind === 'sinking_fund') {
       const m = Math.round(r.amount / 12);
       allocations.push({ name: r.name, monthly: m, kind: 'sinking_fund' });
       totalAllocated += m;
+      sinkingFundMonthlyCommit += m;
+      sinkingFundAnnualTotal += r.amount;
     } else if (r.kind === 'expense') {
       allocations.push({ name: r.name, monthly: r.amount, kind: 'expense' });
       totalAllocated += r.amount;
@@ -665,6 +703,87 @@ async function getState(args: any, data: DataAPI) {
   const netWorth = totalAssets - totalDebt;
   const spendable = totalAssets - totalDebt - totalAllocated;
 
+  // month_forecast — 이번 달에 한해서만 의미 있음.
+  let monthForecast: any = null;
+  if (isCurrentMonth) {
+    const todayDate = new Date();
+    const todayDay = todayDate.getUTCDate();
+    const year = todayDate.getUTCFullYear();
+    const mIdx = todayDate.getUTCMonth();
+    const daysInMonth = new Date(Date.UTC(year, mIdx + 1, 0)).getUTCDate();
+    const daysRemaining = Math.max(0, daysInMonth - todayDay);
+
+    // 이번 달 거래에서 이미 처리된 recurring_id 집합.
+    const processedRecurringIds = new Set(
+      allTxns.map(t => t.recurring_id).filter(Boolean) as string[]
+    );
+
+    const upcoming: Array<{
+      id: string; name: string; amount: number; kind: string;
+      day_of_month?: number; estimated: boolean; base_amount?: number;
+    }> = [];
+    let proratedCount = 0;
+    let upcomingExpense = 0, upcomingIncome = 0;
+
+    for (const rec of recurringItems) {
+      if (rec.kind === 'sinking_fund') continue;  // sinking_fund 는 별도 라인으로 처리.
+      if (processedRecurringIds.has(rec.id)) continue;  // 이미 이번 달에 처리됨.
+
+      if (rec.day_of_month) {
+        // 정확한 날짜 기반 — 이미 매칭 안 됐으니 처리 예정 또는 입력 누락. 보수적으로 차감에 포함.
+        upcoming.push({
+          id: rec.id, name: rec.name, amount: rec.amount, kind: rec.kind,
+          day_of_month: rec.day_of_month, estimated: false,
+        });
+        if (rec.kind === 'expense') upcomingExpense += rec.amount;
+        else if (rec.kind === 'income') upcomingIncome += rec.amount;
+      } else {
+        // day_of_month 없음 → 비례 배분.
+        const prorated = Math.round(rec.amount * daysRemaining / daysInMonth);
+        upcoming.push({
+          id: rec.id, name: rec.name, amount: prorated, kind: rec.kind,
+          estimated: true, base_amount: rec.amount,
+        });
+        if (rec.kind === 'expense') upcomingExpense += prorated;
+        else if (rec.kind === 'income') upcomingIncome += prorated;
+        proratedCount++;
+      }
+    }
+
+    const projectedOutflow = upcomingExpense + sinkingFundMonthlyCommit;
+    const projectedInflow = upcomingIncome;
+    const projectedMonthEndPl = currentMonthPl + projectedInflow - projectedOutflow;
+    const projectedMonthEndNetWorth = netWorth + projectedInflow - projectedOutflow;
+
+    const estimationNotes: string[] = [];
+    if (proratedCount > 0) {
+      estimationNotes.push(
+        `정기 항목 ${proratedCount}건이 day_of_month 미설정 — 비례 배분으로 추정. 정확한 날짜가 있으면 add_recurring 또는 update_entry 로 day_of_month 를 채워주세요.`
+      );
+    }
+    const missedRecurring = upcoming.filter(u => u.day_of_month && u.day_of_month <= todayDay);
+    if (missedRecurring.length > 0) {
+      estimationNotes.push(
+        `이번 달 처리 예정일(${missedRecurring.map(m => m.day_of_month).join(', ')}) 이 지났는데 recurring_id 매칭 거래가 없는 항목 ${missedRecurring.length}건. 이미 처리됐다면 update_entry 로 해당 거래에 recurring_id 를 채워주세요.`
+      );
+    }
+
+    monthForecast = {
+      today: todayDate.toISOString().slice(0, 10),
+      days_in_month: daysInMonth,
+      days_remaining: daysRemaining,
+      upcoming_recurring: upcoming,
+      sinking_fund_monthly_commit: sinkingFundMonthlyCommit,
+      sinking_fund_annual_total: sinkingFundAnnualTotal,
+      projected_outflow: projectedOutflow,
+      projected_inflow: projectedInflow,
+      projected_month_end_pl: projectedMonthEndPl,
+      projected_month_end_net_worth: projectedMonthEndNetWorth,
+      estimation_notes: estimationNotes,
+    };
+  }
+
+  // pace_vs_goal — 월간 페이스(projection 기반) + 전체 누적 페이스 둘 다 노출.
   const goal = goalRaw as Goal | null;
   let pace: any = null;
   if (goal) {
@@ -675,12 +794,20 @@ async function getState(args: any, data: DataAPI) {
     const start = Date.parse(goal.created_at);
     const monthsTotal = Math.max(1, Math.round((end - start) / (30 * 86400000)));
     const expectedSavings = goal.amount * (1 - monthsLeft / monthsTotal);
+
+    const projectedMonthPl = monthForecast ? monthForecast.projected_month_end_pl : currentMonthPl;
+    const monthShortfall = neededPerMonth - projectedMonthPl;
+
     pace = {
       months_left: monthsLeft,
       remaining,
       needed_per_month: neededPerMonth,
-      current: netWorth,
-      on_track: netWorth >= expectedSavings,
+      current_net_worth: netWorth,
+      current_month_pl: currentMonthPl,
+      projected_month_pl: projectedMonthPl,
+      month_on_track: projectedMonthPl >= neededPerMonth,
+      month_shortfall: monthShortfall,                    // 양수 = 부족, 음수 = 여유
+      cumulative_on_track: netWorth >= expectedSavings,   // 누적 진척이 일정 대비 OK?
     };
   }
 
@@ -709,7 +836,14 @@ async function getState(args: any, data: DataAPI) {
     spendable,
     total_allocated: totalAllocated,
     allocations,
-    this_month_summary: { total_expense: totalExpense, total_income: totalIncome, by_category: byCategory },
+    this_month_summary: {
+      total_expense: totalExpense,         // 발생주의 — 새로 발생한 지출
+      total_income: totalIncome,           // 발생주의 — 새로 들어온 수입
+      total_card_payment: totalCardPayment, // 카드값 결제. P&L 영향 없음 (이전 지출의 정산). 페이스 계산에 합산 금지.
+      current_month_pl: currentMonthPl,    // = total_income - total_expense (발생주의 기준)
+      by_category: byCategory,
+    },
+    month_forecast: monthForecast,
     pace_vs_goal: pace,
     recent_transactions: recent,
     pending: pendingItems,

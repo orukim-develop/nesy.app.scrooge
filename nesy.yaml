@@ -44,11 +44,15 @@ tools:
 
       잔고 자체를 강제 조정해야 하는 경우 (마도서 잔고가 실제 통장과 어긋났을 때 등) 에는 가짜 거래를 박지 말고 update_entry 로 직접 balance 를 덮어쓰세요.
 
+      ★ recurring_id ★
+      이 거래가 등록된 recurring (월세, 차량할부, 월급 등) 의 이번 달 인스턴스라면 **반드시 recurring_id 를 채워주세요**. month_forecast 가 "이미 처리됨" 판정에 이 필드를 사용합니다. 누락되면 예측이 같은 항목을 또 차감해 과대 예측이 됩니다.
+      매칭 방법: get_state 응답의 `recurring` 배열에서 사용자가 말한 항목(예: "LH 월세") 의 id 를 찾아 채우세요.
+
       type 별 처리:
       - expense: 효용을 얻은 지출. 현금·체크는 from_account=자산id, 신용카드는 from_account=부채(카드)id 로 보내면 카드 미결제가 증가. 마통이 통장 본체인 경우 from_account=부채(마통)id 로 박으면 마통 빚 증가.
       - income: 수입. to_account=자산id 가 기본. 마통이 통장 본체인 경우 to_account=부채(마통)id 로 박으면 빚 감소로 처리.
       - transfer: 통장 간 단순 이동. 자산 이동이지 지출이 아닙니다. (자산 ↔ 자산만 가정 — 자산→부채는 card_payment 를 사용하세요.)
-      - card_payment: 자산→부채 상환. 카드값 결제뿐 아니라 학자금·주담대·일반대출 갚을 때도 동일. from_account=자산(통장)id, to_account=부채(카드·대출)id. 지출로 잡지 않습니다 — 카드값 이중계상 방지의 핵심.
+      - card_payment: 자산→부채 상환. 카드값 결제뿐 아니라 학자금·주담대·일반대출 갚을 때도 동일. from_account=자산(통장)id, to_account=부채(카드·대출)id. **지출로 잡지 않습니다 — P&L (수입-지출) 영향 없음.** 카드값 이중계상 방지의 핵심. 페이스·예산 계산에서 card_payment 를 expense 와 합산하면 안 됩니다.
 
       카드 사용 시 "1000원 썼는데 할인받아서 950원만 승인됨" 같은 경우 amount=950, original_amount=1000.
       expense 가 같은 카테고리 평균을 anomaly_threshold_ratio 배 이상 넘으면 자동으로 pending 큐(kind=anomaly)에 들어갑니다.
@@ -80,6 +84,9 @@ tools:
         date:
           type: string
           description: ISO (YYYY-MM-DD). 생략 시 오늘.
+        recurring_id:
+          type: string
+          description: 이 거래가 등록된 recurring 의 이번 달 인스턴스이면 그 recurring 의 id. get_state 응답의 recurring 배열에서 찾아 채움. 누락되면 month_forecast 가 같은 항목을 또 예측해 과대 예측.
       required: [type, amount]
 
   - name: record_voucher_use
@@ -168,7 +175,11 @@ tools:
       kind=sinking_fund: 연 1회 자동차세, 분기별 보험, 명절 비용 같은 비정기 큰 지출 — annual_amount/12 만큼 매월 미리 할당해서 갑작스러운 큰 지출에 대비.
       "쓸 수 있는 돈" = 자산 - 부채 - 할당분 — 이 계산이 정확하려면 등록이 필수입니다.
 
-      ※ 현재 자동 실행은 하지 않습니다 — 매월 실제 지출은 사용자가 record_transaction 으로 직접 기록해야 합니다. recurring 은 예산 할당 계획 (spendable 계산용) 으로만 사용됩니다.
+      ※ 현재 자동 실행은 하지 않습니다 — 매월 실제 지출은 사용자가 record_transaction 으로 직접 기록해야 합니다. recurring 은 예산 할당 계획 (spendable / month_forecast 계산용) 으로 사용됩니다.
+
+      ★ 반환된 id 를 기억해두세요. 이후 사용자가 이 정기 항목의 이번 달 거래를 입력할 때 (예: "월세 빠졌어") record_transaction 에 recurring_id 로 같이 넘기면 month_forecast 가 정확해집니다.
+
+      ★ day_of_month 는 가능하면 채우세요. 없으면 month_forecast 가 비례 배분으로 추정합니다 (정확도 떨어짐).
     inputSchema:
       type: object
       properties:
@@ -185,7 +196,7 @@ tools:
           description: monthly | yearly | quarterly.
         day_of_month:
           type: integer
-          description: 월 며칠 (예 25 = 월급일). 선택.
+          description: 월 며칠 (예 25 = 월급일). 가능한 한 채워주세요 — 없으면 month_forecast 가 비례 배분 추정으로 떨어집니다.
         category:
           type: string
         account_id:
@@ -267,16 +278,30 @@ tools:
     description: |
       현재 재무 상태 전체를 반환합니다. 사용자에게 조언·현황 설명을 하기 전에 항상 먼저 호출하세요.
 
+      ★ 월 페이스 판단 시 — 반드시 다음 필드 사용 ★
+      - `pace_vs_goal.month_on_track` (boolean) → 이번 달 예측 P&L 이 목표 페이스에 도달하는가
+      - `pace_vs_goal.projected_month_pl` → 이번 달 최종 예상 net (= 이미 발생한 P&L + 남은 일수 recurring 차감)
+      - `month_forecast.upcoming_recurring` → 아직 빠지지 않은 정기 항목 (월세, 차량할부, sinking_fund 등)
+      현재 시점 snapshot (net_worth, current_month_pl) 만 보고 "이번 달 페이스 OK" 라고 결론 내리면 안 됩니다 — 남은 일수 정기 지출을 빠뜨려 정반대 결론이 나옵니다.
+
+      ★ 발생주의 vs 현금주의 ★
+      - `total_expense`, `current_month_pl` 은 발생주의 — 새로 발생한 지출만 포함.
+      - `total_card_payment` 는 카드값 결제 (이전 달 지출의 정산). **P&L 영향 없음 — 페이스 계산에서 expense 와 합산 금지.**
+      마통이 입출금통장 본체라 income/expense 가 마통 부채로 흘러도 동일 원칙. 부채 잔고 변동을 P&L 로 착각하지 마세요.
+
       반환 필드:
       - accounts, debts, net_worth, total_assets, total_debt
       - allocations (정기+sinking 월간 할당), total_allocated, spendable (자산 - 부채 - 할당)
-      - goal (근거 포함), pace_vs_goal (월 얼마 모아야 도달하는지, on_track 여부)
-      - this_month_summary (총수입·총지출·카테고리별)
-      - recurring (등록된 정기), pending (미해결 큐 — 반드시 사용자에게 알려 처리 유도)
+      - goal (근거 포함)
+      - pace_vs_goal: { months_left, remaining, needed_per_month, current_month_pl, projected_month_pl, month_on_track, month_shortfall, cumulative_on_track }
+      - this_month_summary: { total_expense, total_income, total_card_payment, current_month_pl, by_category }
+      - month_forecast: { today, days_in_month, days_remaining, upcoming_recurring[], sinking_fund_monthly_commit, sinking_fund_annual_total, projected_outflow, projected_inflow, projected_month_end_pl, projected_month_end_net_worth, estimation_notes[] } — 이번 달 조회 시에만. 과거 달 조회 시 null.
+      - recurring (등록된 정기 항목 전체 — record_transaction 시 recurring_id 매칭에 사용)
+      - pending (미해결 큐 — 반드시 사용자에게 알려 처리 유도)
       - recent_transactions (최근 10건), voucher_balances ({바우처명: 잔액})
       - nag (현재 상태에 대한 조언·경고를 1~3줄로 정리. nag_intensity 설정에 따라 강도 조절. 그대로 인용하거나 풀어 써도 됩니다.)
 
-      month 인자로 다른 달 조회 가능 (생략 시 이번 달).
+      month 인자로 다른 달 조회 가능 (생략 시 이번 달). 과거 달 조회 시 month_forecast 는 null.
     inputSchema:
       type: object
       properties:
