@@ -22,7 +22,7 @@ type DataAPI = {
   get(key: string): Promise<any>;
   set(key: string, value: any): Promise<void>;
   delete(key: string): Promise<boolean>;
-  list(prefix?: string, limit?: number): Promise<Array<{ key: string; value?: any; updated_at: string }>>;
+  list(prefix?: string, limit?: number, startAfter?: string): Promise<Array<{ key: string; value?: any; updated_at: string }>>;
 };
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -48,6 +48,7 @@ export async function run({ input, data }: {
     case 'add_recurring': return addRecurring(args, data);
     case 'update_entry': return updateEntry(args, data);
     case 'delete_entry': return deleteEntry(args, data);
+    case 'list_transactions': return listTransactions(args, data);
     case 'get_state': return getState(args, data);
     case 'daily_briefing': return dailyBriefing(data);
     case 'render_board': return renderBoard(args, data);
@@ -191,7 +192,7 @@ async function checkAnomaly(data: DataAPI, txn: Transaction): Promise<string | n
     months.push(d.toISOString().slice(0, 7));
   }
 
-  const monthlyResults = await Promise.all(months.map(ym => data.list(`txn:${ym}:`)));
+  const monthlyResults = await Promise.all(months.map(ym => data.list(`txn:${ym}:`, 1000)));
   const amounts: number[] = [];
   for (const rows of monthlyResults) {
     for (const r of rows) {
@@ -253,7 +254,7 @@ async function reconcileBankStatement(args: any, data: DataAPI) {
     monthList.push(mc.toISOString().slice(0, 7));
     mc.setUTCMonth(mc.getUTCMonth() + 1);
   }
-  const monthResults = await Promise.all(monthList.map(ym => data.list(`txn:${ym}:`)));
+  const monthResults = await Promise.all(monthList.map(ym => data.list(`txn:${ym}:`, 1000)));
   const userTxns: Transaction[] = [];
   for (const rows of monthResults) {
     for (const r of rows) {
@@ -658,7 +659,7 @@ async function getState(args: any, data: DataAPI) {
     data.list('pending:'),
     data.list('voucher_balance:'),
     data.get('goal'),
-    data.list(`txn:${month}:`),
+    data.list(`txn:${month}:`, 1000),
     data.get('__settings'),
   ]);
 
@@ -853,6 +854,120 @@ async function getState(args: any, data: DataAPI) {
 
   const intensity = (settingsRaw as any)?.nag_intensity || '보통';
   return { ...result, nag: scroogeNag(result, intensity) };
+}
+
+async function listTransactions(args: any, data: DataAPI) {
+  const month = args.month as string | undefined;
+  const dateFrom = args.date_from as string | undefined;     // YYYY-MM-DD
+  const dateTo = args.date_to as string | undefined;
+  const type = args.type as string | undefined;
+  const category = args.category as string | undefined;
+  const merchantQuery = (args.merchant_query as string | undefined)?.toLowerCase();
+  const fromAccount = args.from_account as string | undefined;
+  const toAccount = args.to_account as string | undefined;
+  const recurringId = args.recurring_id as string | undefined;
+  const limit = Math.min(Math.max(1, Math.floor(Number(args.limit) || 100)), 500);
+  const cursor = args.cursor as string | undefined;
+
+  // 조회할 월 prefix 목록 결정.
+  const months: string[] = [];
+  if (dateFrom && dateTo) {
+    const startY = Number(dateFrom.slice(0, 4));
+    const startM = Number(dateFrom.slice(5, 7));
+    const endY = Number(dateTo.slice(0, 4));
+    const endM = Number(dateTo.slice(5, 7));
+    let y = startY, m = startM;
+    while (y < endY || (y === endY && m <= endM)) {
+      months.push(`${y}-${String(m).padStart(2, '0')}`);
+      m++;
+      if (m > 12) { m = 1; y++; }
+      if (months.length > 60) break;  // 5년 cap — 폭주 방지.
+    }
+  } else if (month) {
+    months.push(month);
+  } else {
+    months.push(thisMonth());
+  }
+
+  // 월별 끌어오기. 한 달이 cap (1000) 닿으면 warning.
+  const warnings: string[] = [];
+  const allTxns: Transaction[] = [];
+  const monthResults = await Promise.all(months.map(ym => data.list(`txn:${ym}:`, 1000)));
+  monthResults.forEach((rows, i) => {
+    if (rows.length >= 1000) {
+      warnings.push(`${months[i]} 월 거래가 데이터 cap (1000) 에 닿음 — 일부 누락 가능. 해당 월 단독 조회 + 더 좁은 필터 권장.`);
+    }
+    for (const r of rows) {
+      if (r.value) allTxns.push(r.value as Transaction);
+    }
+  });
+
+  // 필터 적용.
+  const filtered = allTxns.filter(t => {
+    if (type && t.type !== type) return false;
+    if (category && t.category !== category) return false;
+    if (merchantQuery && !(t.merchant || '').toLowerCase().includes(merchantQuery)) return false;
+    if (fromAccount && t.from_account !== fromAccount) return false;
+    if (toAccount && t.to_account !== toAccount) return false;
+    if (recurringId && t.recurring_id !== recurringId) return false;
+    if (dateFrom && t.date < dateFrom) return false;
+    if (dateTo && t.date > dateTo) return false;
+    return true;
+  });
+
+  // 시간 역순 정렬 (최신 거래 먼저).
+  filtered.sort((a, b) => b.date.localeCompare(a.date) || b.created_at.localeCompare(a.created_at));
+
+  // 집계 — 필터 만족 전체 기준 (cap 무관, 항상 정확).
+  const totalCountInFilter = filtered.length;
+  const totalAmount = filtered.reduce((s, t) => s + t.amount, 0);
+
+  // 카테고리별 집계 — expense 거래에 한해.
+  const byCategory: Record<string, number> = {};
+  for (const t of filtered) {
+    if (t.type === 'expense') {
+      const c = t.category || '미분류';
+      byCategory[c] = (byCategory[c] || 0) + t.amount;
+    }
+  }
+
+  // 타입별 집계.
+  const byType: Record<string, { count: number; sum: number }> = {};
+  for (const t of filtered) {
+    if (!byType[t.type]) byType[t.type] = { count: 0, sum: 0 };
+    byType[t.type].count++;
+    byType[t.type].sum += t.amount;
+  }
+
+  // Cursor pagination — 이전 응답의 마지막 txn id 이후로 자름.
+  let startIdx = 0;
+  if (cursor) {
+    const i = filtered.findIndex(t => t.id === cursor);
+    if (i >= 0) startIdx = i + 1;
+  }
+  const page = filtered.slice(startIdx, startIdx + limit);
+  const hasMore = (startIdx + limit) < filtered.length;
+  const nextCursor = hasMore && page.length > 0 ? page[page.length - 1].id : undefined;
+
+  // 응답 텍스트.
+  const scopeNote = months.length === 1 ? months[0] : `${months[0]} ~ ${months[months.length - 1]} (${months.length}개월)`;
+  const text = `조회 ${scopeNote} — ${totalCountInFilter}건, 합 ${fmt(totalAmount)}원${
+    page.length < totalCountInFilter ? ` (이번 응답 ${page.length}건${hasMore ? ', has_more' : ''})` : ''
+  }${warnings.length ? ` · ⚠ ${warnings.length}건 경고` : ''}.`;
+
+  return {
+    text,
+    transactions: page,
+    count: page.length,
+    total_count_in_filter: totalCountInFilter,
+    total_amount: totalAmount,
+    by_category: byCategory,
+    by_type: byType,
+    has_more: hasMore,
+    next_cursor: nextCursor,
+    scope: { months_scanned: months, ...(dateFrom ? { date_from: dateFrom } : {}), ...(dateTo ? { date_to: dateTo } : {}) },
+    warnings: warnings.length ? warnings : undefined,
+  };
 }
 
 async function dailyBriefing(data: DataAPI) {

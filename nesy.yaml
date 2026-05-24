@@ -274,6 +274,66 @@ tools:
           description: voucher_use 삭제 시 필요.
       required: [entity_type]
 
+  - name: list_transactions
+    description: |
+      거래 내역을 필터·정렬해서 조회합니다. "지난주 식비 다 보여줘", "5월에 신한카드로 박힌 거 다", "이번 달 카페에 쓴 돈" 같은 사용자 질문에 호출하세요. read-only — 수정·삭제는 update_entry / delete_entry.
+
+      ★ 응답 구조 ★
+      - `transactions[]` — 필터 후 시간 역순. 최대 `limit` (기본 100, max 500) 건만 반환.
+      - `total_count_in_filter` / `total_amount` — 필터 만족 전체 건수·합. **cap 무관, 항상 정확.**
+      - `by_category` — expense 거래의 카테고리별 합 (항상 계산).
+      - `by_type` — type 별 { count, sum }.
+      - `has_more` / `next_cursor` — 다음 페이지 있으면 next_cursor 박아서 재호출.
+      - `scope.months_scanned` — 마도서가 실제로 훑은 월 prefix 목록.
+      - `warnings` — 한 달 거래가 데이터 cap (1000) 에 닿으면 알림. 더 좁은 필터 권장.
+
+      ★ 조회 범위 ★
+      - `month` (YYYY-MM) — 단일 월, 가장 빠름.
+      - `date_from` + `date_to` (YYYY-MM-DD) — 임의 범위. 마도서가 걸치는 월들을 자동으로 chunks 로 끌어옴 (월 1000 cap 적용).
+      - 둘 다 안 주면 기본 이번 달.
+      - 5년 (60개월) 초과 범위는 잘림.
+
+      ★ 필터 ★
+      - `type`: expense | income | transfer | card_payment
+      - `category`: 정확 매칭
+      - `merchant_query`: merchant 부분 매칭 (대소문자 무관)
+      - `from_account` / `to_account` / `recurring_id`: id 정확 매칭
+
+      ★ 페이지네이션 ★
+      이전 응답의 `next_cursor` 를 다음 호출의 `cursor` 에 그대로 넘기면 이어집니다. 같은 필터를 유지하세요.
+    inputSchema:
+      type: object
+      properties:
+        month:
+          type: string
+          description: YYYY-MM. date_from/date_to 안 주면 기본 이번 달.
+        date_from:
+          type: string
+          description: YYYY-MM-DD. date_to 와 짝.
+        date_to:
+          type: string
+          description: YYYY-MM-DD. date_from 과 짝.
+        type:
+          type: string
+          description: expense | income | transfer | card_payment
+        category:
+          type: string
+        merchant_query:
+          type: string
+          description: merchant 부분 매칭 (대소문자 무관).
+        from_account:
+          type: string
+        to_account:
+          type: string
+        recurring_id:
+          type: string
+        limit:
+          type: integer
+          description: 기본 100, max 500.
+        cursor:
+          type: string
+          description: 이전 응답의 next_cursor.
+
   - name: get_state
     description: |
       현재 재무 상태 전체를 반환합니다. 사용자에게 조언·현황 설명을 하기 전에 항상 먼저 호출하세요.

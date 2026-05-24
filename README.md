@@ -4,7 +4,7 @@
 
 분석이나 말투는 호출 AI 가 직접 한다. 마도서는 데이터 저장 · 잔고 계산 · 경고 신호 생성만 책임진다. 잔소리 강도는 `user_settings.nag_intensity` (부드럽게 / 보통 / 매섭게) 로 조절한다. `get_state` 응답의 `nag` 필드에 현재 상태에 맞춘 경고 1~3줄이 같이 나오니 그대로 인용하거나 풀어 써도 좋다.
 
-## 도구 (9개)
+## 도구 (10개)
 
 - `setup_state` — 초기 자산 / 부채 / 목표 스냅샷. **현재 시점 잔액을 강제 덮어쓰기** 합니다. 거래 누적 없이 그 자리에 박아 넣음. 잔고 보정용으로 다시 부르지 마세요.
 - `record_transaction` — 거래 1건을 저장하고 **기존 잔고에 누적**합니다. 4-type 모델 (expense / income / transfer / card_payment) 로 카드값 이중계상 차단.
@@ -14,6 +14,7 @@
 - `add_recurring` — 월 고정비 + sinking fund 할당.
 - `update_entry` — 전 entity_type 수정. **값을 그대로 덮어쓰기.** 잔고가 실제 통장과 어긋났을 때는 `setup_state` 가 아니라 이 도구로 직접 balance 를 보정합니다.
 - `delete_entry` — 전 entity_type 삭제. transaction 은 잔고 자동 역연산, voucher_use 는 바우처 잔액 자동 보정.
+- `list_transactions` — 거래 내역 조회. month / date 범위 + type / category / merchant / account / recurring_id 필터. cap 무관한 정확한 집계 (total_amount, by_category, by_type) + cursor pagination.
 - `get_state` — 통합 read. 조언 · 경고 전에 항상 호출. `nag` 필드 포함.
 
 ### record_transaction vs update_entry — 헷갈리지 마세요
