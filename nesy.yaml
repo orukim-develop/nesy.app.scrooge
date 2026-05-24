@@ -30,10 +30,10 @@ tools:
     description: |
       개별 거래 기록. "점심 만원 썼어", "월급 들어왔어", "통장에서 적금으로 30만원" 같은 말에 호출.
       type 별 처리:
-      - expense: 효용을 얻은 지출. 현금/체크는 from_account=자산id, 신용카드는 from_account=부채(카드)id 로 보내면 카드 미결제가 증가.
-      - income: 수입. to_account=자산id.
-      - transfer: 통장 간 단순 이동. 자산 이동이지 지출 아님.
-      - card_payment: 카드값 결제. from_account=자산(통장)id, to_account=부채(카드)id. 지출로 잡지 않음 — 다른 가계부의 카드값 이중계상 버그를 막는 핵심.
+      - expense: 효용을 얻은 지출. 현금/체크는 from_account=자산id, 신용카드는 from_account=부채(카드)id 로 보내면 카드 미결제가 증가. 마통이 통장 본체인 경우 from_account=부채(마통)id 로 박으면 마통 빚 증가.
+      - income: 수입. to_account=자산id 가 기본. 마통이 통장 본체인 경우 to_account=부채(마통)id 로 박으면 빚 감소로 처리.
+      - transfer: 통장 간 단순 이동. 자산 이동이지 지출 아님. (자산 ↔ 자산만 가정 — 자산→부채는 card_payment 써라.)
+      - card_payment: 자산→부채 상환. 카드값 결제뿐 아니라 학자금/주담대/일반대출 갚을 때도 동일. from_account=자산(통장)id, to_account=부채(카드/대출)id. 지출로 잡지 않음 — 다른 가계부의 카드값 이중계상 버그를 막는 핵심.
       카드 사용 시 "1000원 썼는데 할인받아서 950원만 승인됨" 같은 경우 amount=950, original_amount=1000.
       expense 가 같은 카테고리 평균을 anomaly_threshold_ratio 배 이상 넘으면 자동으로 pending 큐(kind=anomaly)에 들어간다.
     inputSchema:

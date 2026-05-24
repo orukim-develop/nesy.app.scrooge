@@ -123,8 +123,15 @@ async function recordTransaction(args: any, data: DataAPI) {
     }
   } else if (type === 'income') {
     if (txn.to_account) {
-      const c = await adjustBalance(data, txn.to_account, +amount);
-      if (c) balanceChanges.push(c);
+      const acc = await loadAccountOrDebt(data, txn.to_account);
+      if (acc?.kind === 'debt') {
+        // to_account 가 부채(마통 등) 면 income = 빚 감소
+        const c = await adjustBalance(data, txn.to_account, -amount);
+        if (c) balanceChanges.push(c);
+      } else {
+        const c = await adjustBalance(data, txn.to_account, +amount);
+        if (c) balanceChanges.push(c);
+      }
     }
   } else if (type === 'transfer') {
     if (txn.from_account) { const c = await adjustBalance(data, txn.from_account, -amount); if (c) balanceChanges.push(c); }
@@ -429,7 +436,11 @@ async function applyTxnBalance(data: DataAPI, txn: Transaction, sign: 1 | -1) {
       else await adjustBalance(data, txn.from_account, -amt);
     }
   } else if (txn.type === 'income') {
-    if (txn.to_account) await adjustBalance(data, txn.to_account, +amt);
+    if (txn.to_account) {
+      const found = await loadAccountOrDebt(data, txn.to_account);
+      if (found?.kind === 'debt') await adjustBalance(data, txn.to_account, -amt);
+      else await adjustBalance(data, txn.to_account, +amt);
+    }
   } else if (txn.type === 'transfer') {
     if (txn.from_account) await adjustBalance(data, txn.from_account, -amt);
     if (txn.to_account) await adjustBalance(data, txn.to_account, +amt);
