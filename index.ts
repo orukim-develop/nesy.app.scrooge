@@ -79,8 +79,13 @@ async function setupState(args: any, data: DataAPI) {
     written.push('goal');
   }
 
+  const detailLine = written.length > 0 && written.length <= 30
+    ? `\n등록된 키: ${written.join(', ')}`
+    : written.length > 30
+      ? `\n등록된 키 (처음 30): ${written.slice(0, 30).join(', ')} ... +${written.length - 30}건`
+      : '';
   return {
-    text: `등록 완료: ${written.length}건 (자산 ${accounts.length}, 부채 ${debts.length}${goal ? ', 목표 1' : ''}). 같은 id 가 이미 있었다면 잔고가 덮어쓰기 되었습니다 — 의도가 아니었다면 update_entry 로 보정하세요.`,
+    text: `등록 완료: ${written.length}건 (자산 ${accounts.length}, 부채 ${debts.length}${goal ? ', 목표 1' : ''}).${detailLine}\n같은 id 가 이미 있었다면 잔고가 덮어쓰기 되었습니다 — 의도가 아니었다면 update_entry 로 보정하세요.`,
     written,
   };
 }
@@ -157,8 +162,11 @@ async function recordTransaction(args: any, data: DataAPI) {
   else lead = `카드값/부채 상환 ${fmt(amount)}원 기록 (지출로 잡지 않음).`;
 
   const catTag = (type === 'expense' && txn.category) ? ` (${txn.category})` : '';
+  const merTag = txn.merchant ? ` ${txn.merchant}` : '';
+  const balLine = balanceChanges.length > 0 ? ` 잔고 변경: ${balanceChanges.join(' / ')}.` : '';
+  const recurNote = txn.recurring_id ? ` [recurring:${txn.recurring_id} 처리됨]` : '';
   return {
-    text: `${lead}${catTag}${anomalyNote}`,
+    text: `${lead}${merTag}${catTag}${balLine}${recurNote}${anomalyNote} (id: ${id})`,
     id,
     balance_changes: balanceChanges,
   };
@@ -414,7 +422,11 @@ async function addRecurring(args: any, data: DataAPI) {
   const tail = kind === 'sinking_fund'
     ? `연 ${fmt(amount)}원 → 매월 ${fmt(amount / 12)}원 할당.`
     : kind === 'expense' ? `매월 ${fmt(amount)}원 할당.` : `월 ${fmt(amount)}원 수입으로 등록.`;
-  return { text: `${name} 등록. ${tail}`, id };
+  const dayNote = args.day_of_month ? ` (매월 ${args.day_of_month}일)` : ' (day_of_month 미설정 — month_forecast 가 비례 배분 추정)';
+  return {
+    text: `${name} 등록 (id: ${id}). ${tail}${dayNote}\n★ 이 id 를 기억 — 사용자가 이 정기 항목의 거래를 입력할 때 record_transaction 에 recurring_id="${id}" 로 채워야 month_forecast 가 "이미 처리됨" 판정.`,
+    id,
+  };
 }
 
 // 거래의 잔고 영향을 적용/되돌리기 위한 단일 진입점. sign=+1 적용, sign=-1 되돌림.
@@ -465,7 +477,12 @@ async function updateEntry(args: any, data: DataAPI) {
     const next = { ...cur, ...patch };
     if (patch.balance !== undefined) next.balance = Number(patch.balance);
     await data.set(key, next);
-    return { text: `${next.name || id} 갱신 완료.`, entity: next };
+    const oldBal = (cur as any).balance ?? 0;
+    const newBal = next.balance ?? 0;
+    const balLine = patch.balance !== undefined
+      ? ` balance ${fmt(oldBal)} → ${fmt(newBal)} 원 (${entityType === 'debt' ? '부채' : '자산'}).`
+      : ` 현재 balance ${fmt(newBal)}원.`;
+    return { text: `${next.name || id} (${entityType}) 갱신 완료.${balLine}`, entity: next };
   }
 
   if (entityType === 'recurring') {
@@ -475,7 +492,8 @@ async function updateEntry(args: any, data: DataAPI) {
     const next = { ...cur, ...patch };
     if (patch.amount !== undefined) next.amount = Number(patch.amount);
     await data.set(key, next);
-    return { text: `${next.name || id} 정기 항목 갱신.`, entity: next };
+    const dayPart = next.day_of_month ? `, 매월 ${next.day_of_month}일` : '';
+    return { text: `${next.name || id} 정기 항목 갱신 — amount ${fmt(next.amount)}원, kind ${next.kind}${dayPart}.`, entity: next };
   }
 
   if (entityType === 'transaction') {
@@ -499,7 +517,9 @@ async function updateEntry(args: any, data: DataAPI) {
     }
     // 새 영향 다시 적용
     await applyTxnBalance(data, next, +1);
-    return { text: `거래 ${id} 갱신: ${fmt(next.amount)}원. 잔고 자동 보정됨.`, entity: next };
+    const mer = next.merchant ? ` ${next.merchant}` : '';
+    const cat = next.category ? ` (${next.category})` : '';
+    return { text: `거래 ${id} 갱신 — ${next.date} ${next.type}${mer}${cat} ${fmt(next.amount)}원. 잔고 자동 보정됨.`, entity: next };
   }
 
   if (entityType === 'voucher_use') {
@@ -514,13 +534,14 @@ async function updateEntry(args: any, data: DataAPI) {
     await data.set(key, next);
     // 바우처 잔액 보정: 옛 금액 복원 + 새 금액 차감
     const delta = oldAmount - Number(next.amount_used);
+    const balKey = `voucher_balance:${voucherName}`;
+    const bal = (await data.get(balKey)) as { balance: number } | null;
+    let newBal = bal?.balance ?? 0;
     if (delta !== 0) {
-      const balKey = `voucher_balance:${voucherName}`;
-      const bal = (await data.get(balKey)) as { balance: number } | null;
-      const newBal = (bal?.balance ?? 0) + delta;
+      newBal = newBal + delta;
       await data.set(balKey, { balance: newBal });
     }
-    return { text: `${voucherName} 사용 기록 갱신 — 잔액 보정 완료.`, entity: next };
+    return { text: `${voucherName} 사용 기록 갱신 — amount ${fmt(next.amount_used)}원. 바우처 잔액 ${fmt(newBal)}원.`, entity: next };
   }
 
   throw new Error(`알 수 없는 entity_type: ${entityType}`);
@@ -889,10 +910,24 @@ async function listTransactions(args: any, data: DataAPI) {
     months.push(thisMonth());
   }
 
-  // 월별 끌어오기. 한 달이 cap (1000) 닿으면 warning.
+  // 거래 + account/debt 이름 매핑 동시 로드 (account/debt 은 raw id 대신 이름으로 풀기 위함).
+  const [accountsList, debtsList, ...monthResults] = await Promise.all([
+    data.list('account:'),
+    data.list('debt:'),
+    ...months.map(ym => data.list(`txn:${ym}:`, 1000)),
+  ]);
+
+  const idToName: Record<string, string> = {};
+  for (const r of accountsList) {
+    if (r.value?.id) idToName[r.value.id] = r.value.name || r.value.id;
+  }
+  for (const r of debtsList) {
+    if (r.value?.id) idToName[r.value.id] = r.value.name || r.value.id;
+  }
+  const acctLabel = (id?: string) => id ? (idToName[id] || id) : '';
+
   const warnings: string[] = [];
   const allTxns: Transaction[] = [];
-  const monthResults = await Promise.all(months.map(ym => data.list(`txn:${ym}:`, 1000)));
   monthResults.forEach((rows, i) => {
     if (rows.length >= 1000) {
       warnings.push(`${months[i]} 월 거래가 데이터 cap (1000) 에 닿음 — 일부 누락 가능. 해당 월 단독 조회 + 더 좁은 필터 권장.`);
@@ -949,11 +984,69 @@ async function listTransactions(args: any, data: DataAPI) {
   const hasMore = (startIdx + limit) < filtered.length;
   const nextCursor = hasMore && page.length > 0 ? page[page.length - 1].id : undefined;
 
-  // 응답 텍스트.
+  // ─── text 풀어 쓰기 ─────────────────────────────────────────────
+  // MCP server.ts (nesy.app) 가 응답을 { content:[{type:'text', text}], structuredContent:data }
+  // 로 wrap 하는데, Claude MCP 클라이언트가 structuredContent 를 LLM 한테 안 노출함.
+  // → text 안에 거래 목록·집계·account 이름까지 다 풀어 써야 호출 AI 가 디테일을 봄.
+  // structuredContent 가 풀려도 무해 (중복 정보).
   const scopeNote = months.length === 1 ? months[0] : `${months[0]} ~ ${months[months.length - 1]} (${months.length}개월)`;
-  const text = `조회 ${scopeNote} — ${totalCountInFilter}건, 합 ${fmt(totalAmount)}원${
-    page.length < totalCountInFilter ? ` (이번 응답 ${page.length}건${hasMore ? ', has_more' : ''})` : ''
-  }${warnings.length ? ` · ⚠ ${warnings.length}건 경고` : ''}.`;
+  const lines: string[] = [];
+  lines.push(`조회 ${scopeNote} — 필터 만족 ${totalCountInFilter}건, 합 ${fmt(totalAmount)}원${page.length < totalCountInFilter ? ` (이번 응답 ${page.length}건${hasMore ? ', has_more' : ''})` : ''}.`);
+
+  if (page.length > 0) {
+    lines.push('');
+    lines.push('[거래]');
+    for (const t of page) {
+      const md = t.date.slice(5);  // MM-DD
+      const typeTag =
+        t.type === 'expense' ? '지출' :
+        t.type === 'income' ? '수입' :
+        t.type === 'transfer' ? '이체' : '카드값';
+      const mer = t.merchant || '';
+      const cat = t.category ? ` (${t.category})` : '';
+      const memo = t.memo ? ` "${t.memo}"` : '';
+      const sign = t.type === 'income' ? '+' : '−';
+      let acctNote = '';
+      if (t.type === 'transfer') acctNote = ` | ${acctLabel(t.from_account)} → ${acctLabel(t.to_account)}`;
+      else if (t.type === 'card_payment') acctNote = ` | ${acctLabel(t.from_account)} → ${acctLabel(t.to_account)} 상환`;
+      else if (t.type === 'expense' && t.from_account) acctNote = ` | from ${acctLabel(t.from_account)}`;
+      else if (t.type === 'income' && t.to_account) acctNote = ` | to ${acctLabel(t.to_account)}`;
+      const recur = t.recurring_id ? ` [recurring:${t.recurring_id}]` : '';
+      const orig = t.original_amount && t.original_amount !== t.amount ? ` (정가 ${fmt(t.original_amount)})` : '';
+      lines.push(`${md} ${typeTag} ${mer}${cat} ${sign}${fmt(t.amount)}원${orig}${acctNote}${memo}${recur} (id: ${t.id})`);
+    }
+  }
+
+  if (Object.keys(byCategory).length > 0) {
+    lines.push('');
+    lines.push('[카테고리 집계 — expense 만, 필터 만족 전체 기준]');
+    const sortedCats = Object.entries(byCategory).sort((a, b) => b[1] - a[1]);
+    for (const [c, v] of sortedCats) {
+      lines.push(`${c}: ${fmt(v)}원`);
+    }
+  }
+
+  if (Object.keys(byType).length > 0) {
+    lines.push('');
+    lines.push('[타입별 — 필터 만족 전체 기준]');
+    for (const [tp, { count, sum }] of Object.entries(byType)) {
+      const tpLabel = tp === 'expense' ? '지출' : tp === 'income' ? '수입' : tp === 'transfer' ? '이체' : '카드값';
+      lines.push(`${tpLabel}: ${count}건, ${fmt(sum)}원`);
+    }
+  }
+
+  if (hasMore) {
+    lines.push('');
+    lines.push(`[페이지] next_cursor="${nextCursor}" — 더 보려면 같은 필터에 cursor 박아 재호출.`);
+  }
+
+  if (warnings.length > 0) {
+    lines.push('');
+    lines.push('[경고]');
+    for (const w of warnings) lines.push(`⚠ ${w}`);
+  }
+
+  const text = lines.join('\n');
 
   return {
     text,

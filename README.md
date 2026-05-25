@@ -14,7 +14,7 @@
 - `add_recurring` — 월 고정비 + sinking fund 할당.
 - `update_entry` — 전 entity_type 수정. **값을 그대로 덮어쓰기.** 잔고가 실제 통장과 어긋났을 때는 `setup_state` 가 아니라 이 도구로 직접 balance 를 보정합니다.
 - `delete_entry` — 전 entity_type 삭제. transaction 은 잔고 자동 역연산, voucher_use 는 바우처 잔액 자동 보정.
-- `list_transactions` — 거래 내역 조회. month / date 범위 + type / category / merchant / account / recurring_id 필터. cap 무관한 정확한 집계 (total_amount, by_category, by_type) + cursor pagination.
+- `list_transactions` — 거래 내역 조회. month / date 범위 + type / category / merchant / account / recurring_id 필터. **응답 `text` 에 거래 한 건씩 풀어 쓴 markdown (날짜, 상호, 카테고리, 금액, account 이름, id) + 집계** — 호출 AI 가 이걸 보고 디테일 답함. cursor pagination (기본 100, max 500).
 - `get_state` — 통합 read. 조언 · 경고 전에 항상 호출. `nag` 필드 포함.
 
 ### record_transaction vs update_entry — 헷갈리지 마세요
@@ -60,6 +60,18 @@ get_state 응답에서 페이스 판단에 쓰는 필드:
 - **마통 (마이너스통장) 처리** — 마통은 부채로 등록 후 거래의 `from` / `to` 를 그 부채 id 로 박음. `income` 의 `to_account` 가 부채면 자동으로 빚 감소 처리. `card_payment` 는 카드값 전용이 아니라 자산 → 부채 상환 일반에 사용 (학자금 / 주담대 포함).
 
 **시크릿 없음** — 외부 API 호출 안 함.
+
+## 응답 채널 — `text` 가 메인
+
+nesy.app MCP 가 마도서 응답을 `{ content:[{type:'text', text}], structuredContent:data }` 로 wrap 하는데, Claude MCP 클라이언트가 structuredContent 를 LLM 한테 잘 노출 안 함. → **모든 도구 응답의 `text` 필드 안에 호출 AI 가 답하는 데 필요한 디테일 (id, balance, 거래 목록 등) 이 풀려 있음.** 호출 AI 는 text 만 보고 답 가능 — 별도 채널 보지 마라.
+
+영향:
+- `list_transactions.text` — 거래 한 건씩 풀어 쓴 markdown + 카테고리·타입 집계.
+- `add_recurring.text` — 등록된 id 박힘 (이후 `record_transaction` 의 `recurring_id` 매칭에 그대로 사용).
+- `record_transaction.text` — id + 잔고 변경.
+- `update_entry.text` — 갱신된 balance / amount / entity 핵심 값.
+- `setup_state.text` — 등록된 키 목록.
+- `get_state` — 응답 전체가 JSON 으로 노출 (text 필드 없음 → JSON.stringify 경로).
 
 ## 배포
 
