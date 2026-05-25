@@ -4,7 +4,7 @@
 
 분석이나 말투는 호출 AI 가 직접 한다. 마도서는 데이터 저장 · 잔고 계산 · 경고 신호 생성만 책임진다. 잔소리 강도는 `user_settings.nag_intensity` (부드럽게 / 보통 / 매섭게) 로 조절한다. `get_state` 응답의 `nag` 필드에 현재 상태에 맞춘 경고 1~3줄이 같이 나오니 그대로 인용하거나 풀어 써도 좋다.
 
-## 도구 (10개)
+## 도구 (11개)
 
 - `setup_state` — 초기 자산 / 부채 / 목표 스냅샷. **현재 시점 잔액을 강제 덮어쓰기** 합니다. 거래 누적 없이 그 자리에 박아 넣음. 잔고 보정용으로 다시 부르지 마세요.
 - `record_transaction` — 거래 1건을 저장하고 **기존 잔고에 누적**합니다. 4-type 모델 (expense / income / transfer / card_payment) 로 카드값 이중계상 차단.
@@ -12,10 +12,11 @@
 - `reconcile_bank_statement` — 사용자 기록 vs 실제 명세 대조, 할인 / 누락 보정.
 - `resolve_pending` — 이상지출 · 금액불일치 큐 처리.
 - `add_recurring` — 월 고정비 + sinking fund 할당.
-- `update_entry` — 전 entity_type 수정. **값을 그대로 덮어쓰기.** 잔고가 실제 통장과 어긋났을 때는 `setup_state` 가 아니라 이 도구로 직접 balance 를 보정합니다.
-- `delete_entry` — 전 entity_type 삭제. transaction 은 잔고 자동 역연산, voucher_use 는 바우처 잔액 자동 보정.
+- `update_entry` — 전 entity_type 수정 (account / debt / recurring / transaction / voucher_use / month_note / goal). **값을 그대로 덮어쓰기.** 잔고가 실제 통장과 어긋났을 때는 `setup_state` 가 아니라 이 도구로 직접 balance 를 보정합니다.
+- `delete_entry` — 전 entity_type 삭제. transaction 은 잔고 자동 역연산, voucher_use 는 바우처 잔액 자동 보정, month_note 의 오버라이드는 해제 즉시 글로벌 산식 복귀.
 - `list_transactions` — 거래 내역 조회. month / date 범위 + type / category / merchant / account / recurring_id 필터. **응답 `text` 에 거래 한 건씩 풀어 쓴 markdown (날짜, 상호, 카테고리, 금액, account 이름, id) + 집계** — 호출 AI 가 이걸 보고 디테일 답함. cursor pagination (기본 100, max 500).
-- `get_state` — 통합 read. 조언 · 경고 전에 항상 호출. `nag` 필드 포함.
+- `set_month_note` — 월별 회고 메모 + 페이스 목표 오버라이드 (`needed_per_month` 한시 강제). 같은 달 재호출 시 덮어쓰기. 자동 만료 없음 — `delete_entry(entity_type='month_note', id='YYYY-MM')` 로 해제.
+- `get_state` — 통합 read. 조언 · 경고 전에 항상 호출. `nag` 필드 + `this_month_note` + `month_notes_recent` 포함.
 
 ### record_transaction vs update_entry — 헷갈리지 마세요
 
@@ -48,6 +49,25 @@ get_state 응답에서 페이스 판단에 쓰는 필드:
 - 사용자가 "월세 빠졌어" 하면 → `get_state.recurring` 배열에서 "LH 월세" 의 id 찾기 → `record_transaction(..., recurring_id: 그_id)`
 - `day_of_month` 가 채워져 있으면 정확한 날짜 기반 예측. 비어 있으면 비례 배분 추정 (`estimation_notes` 에 안내가 나옴 — 사용자에게 정확한 날짜 물어봐서 `update_entry` 로 채워라)
 
+## 월별 메모 + 목표 오버라이드
+
+특정 달의 이벤트 회고와 페이스 목표 한시 조정을 위해 `set_month_note` 를 사용한다.
+
+전형적 시나리오: "5월에 장례식 때문에 200만 추가 지출 → 목표 미달. 6월·7월은 `needed_per_month` 30만원으로 고정, 8월에 추이 봐서 재조정."
+
+```
+set_month_note(month='2026-06', note='장례비 이연으로 6-7월 한시 완화',
+               goal_override={ needed_per_month: 300000,
+                               reason: '장례비 이연, 8월 재조정' })
+set_month_note(month='2026-07', ... 동일 ...)
+```
+
+- 범위는 **단일 달만**. 6월·7월 둘 다 적용하려면 두 번 호출.
+- `goal_override` 적용 시 `get_state.pace_vs_goal.needed_per_month` 가 산식(`remaining / monthsLeft`) 대신 지정 값으로 덮어쓰임. `needed_per_month_source: 'override'` 로 표시되고 `needed_per_month_formula` 에 원래 산식 결과가 비교용으로 같이 들어감.
+- **자동 만료 없음**. 한시 완화 의도였더라도 사용자가 직접 `delete_entry(entity_type='month_note', id='YYYY-MM')` 로 풀어야 함. 마도서가 `nag` 와 `/board` 위젯 상단에 "오버라이드 적용 중" 을 띄워 잊지 않게 한다.
+- 부분 수정은 `update_entry(entity_type='month_note', id='YYYY-MM', patch={ note?, goal_override? })`. patch 에서 `goal_override: null` 이면 오버라이드만 해제.
+- 회고용 `note` 만 단독으로도 박을 수 있음 (오버라이드 없이). `month_notes_recent` (최근 6개월) 에 누적되어 호출 AI 가 추세 파악에 사용.
+
 ## 배경 함수
 
 - `daily_briefing` — 일 1회 푸시 알림 (현재 상태 요약).
@@ -71,6 +91,7 @@ nesy.app MCP 가 마도서 응답을 `{ content:[{type:'text', text}], structure
 - `record_transaction.text` — id + 잔고 변경.
 - `update_entry.text` — 갱신된 balance / amount / entity 핵심 값.
 - `setup_state.text` — 등록된 키 목록.
+- `set_month_note.text` — 등록된 달 + note 미리보기 + 오버라이드 값/사유 + 산식과의 비교.
 - `get_state` — 응답 전체가 JSON 으로 노출 (text 필드 없음 → JSON.stringify 경로).
 
 ## 배포

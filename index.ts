@@ -17,6 +17,16 @@ type Pending = {
   created_at: string; status: 'pending' | 'resolved';
   data: Record<string, any>;
 };
+type MonthNote = {
+  month: string;          // YYYY-MM
+  note?: string;          // 자유 메모 ("장례식 비용 200만, 목표 미달" 같은 회고)
+  goal_override?: {       // 페이스 산식(remaining/monthsLeft) 덮어쓰기
+    needed_per_month: number;
+    reason: string;       // "장례비 이연, 6-7월 한시" 같은 사유
+  };
+  created_at: string;
+  updated_at: string;
+};
 
 type DataAPI = {
   get(key: string): Promise<any>;
@@ -49,6 +59,7 @@ export async function run({ input, data }: {
     case 'update_entry': return updateEntry(args, data);
     case 'delete_entry': return deleteEntry(args, data);
     case 'list_transactions': return listTransactions(args, data);
+    case 'set_month_note': return setMonthNote(args, data);
     case 'get_state': return getState(args, data);
     case 'daily_briefing': return dailyBriefing(data);
     case 'render_board': return renderBoard(args, data);
@@ -522,6 +533,35 @@ async function updateEntry(args: any, data: DataAPI) {
     return { text: `거래 ${id} 갱신 — ${next.date} ${next.type}${mer}${cat} ${fmt(next.amount)}원. 잔고 자동 보정됨.`, entity: next };
   }
 
+  if (entityType === 'month_note') {
+    // id = YYYY-MM. patch 로 부분 갱신 (note / goal_override). null 박으면 그 필드 제거.
+    if (!id || !/^\d{4}-\d{2}$/.test(id)) throw new Error('month_note 의 id 는 YYYY-MM 형식이어야 합니다.');
+    const key = `month_note:${id}`;
+    const cur = (await data.get(key)) as MonthNote | null;
+    if (!cur) throw new Error(`${key} 가 존재하지 않습니다. set_month_note 로 먼저 등록하세요.`);
+    const next: MonthNote = { ...cur, updated_at: now() };
+    if ('note' in patch) {
+      if (patch.note === null || patch.note === '') next.note = undefined;
+      else next.note = String(patch.note);
+    }
+    if ('goal_override' in patch) {
+      if (patch.goal_override === null) next.goal_override = undefined;
+      else {
+        const ovr = patch.goal_override as { needed_per_month?: any; reason?: string };
+        const npm = Number(ovr?.needed_per_month);
+        if (!Number.isFinite(npm) || npm < 0) throw new Error('goal_override.needed_per_month 가 잘못됨.');
+        if (!ovr?.reason) throw new Error('goal_override.reason 이 필요합니다.');
+        next.goal_override = { needed_per_month: Math.round(npm), reason: ovr.reason };
+      }
+    }
+    await data.set(key, next);
+    const lines: string[] = [`${id} 월 메모 갱신.`];
+    if (next.note) lines.push(`메모: ${next.note}`);
+    if (next.goal_override) lines.push(`목표 오버라이드: ${fmt(next.goal_override.needed_per_month)}원 (${next.goal_override.reason})`);
+    else lines.push(`목표 오버라이드: 없음 (글로벌 산식 사용)`);
+    return { text: lines.join('\n'), entity: next };
+  }
+
   if (entityType === 'voucher_use') {
     const voucherName = args.voucher_name as string;
     if (!voucherName) throw new Error('voucher_use 수정에는 voucher_name 이 필요합니다.');
@@ -604,6 +644,16 @@ async function deleteEntry(args: any, data: DataAPI) {
     return { text: `${voucherName} 사용 ${fmt(amt)}원 취소 — 잔액 복원 완료.`, deleted: true };
   }
 
+  if (entityType === 'month_note') {
+    if (!id || !/^\d{4}-\d{2}$/.test(id)) throw new Error('month_note 의 id 는 YYYY-MM 형식이어야 합니다.');
+    const key = `month_note:${id}`;
+    const cur = (await data.get(key)) as MonthNote | null;
+    const ok = await data.delete(key);
+    if (!ok) return { text: `${id} 월 메모가 없습니다.`, deleted: false };
+    const tail = cur?.goal_override ? ` (이 달 페이스 계산이 글로벌 산식으로 복귀)` : '';
+    return { text: `${id} 월 메모 삭제 완료.${tail}`, deleted: true };
+  }
+
   throw new Error(`알 수 없는 entity_type: ${entityType}`);
 }
 
@@ -617,6 +667,12 @@ function scroogeNag(state: any, intensity: string): string[] {
       ? `쓸 수 있는 돈이 ${fmt(Math.abs(state.spendable))}원 부족합니다. 즉시 조정이 필요합니다.`
       : soft ? `쓸 수 있는 돈이 ${fmt(Math.abs(state.spendable))}원 부족합니다.`
       : `쓸 수 있는 돈이 ${fmt(Math.abs(state.spendable))}원 부족합니다. 조정이 필요합니다.`);
+  }
+
+  // 이번 달 메모 (있으면 페이스 경고보다 먼저 — 맥락 깔기).
+  const tmn = state.this_month_note;
+  if (tmn?.note) {
+    lines.push(`${state.month} 메모: ${tmn.note}`);
   }
 
   // 월 페이스 경고 — 반드시 projection 기반.
@@ -638,6 +694,13 @@ function scroogeNag(state: any, intensity: string): string[] {
   }
   if (p && p.cumulative_on_track === false) {
     lines.push(`누적 진척이 일정 대비 미달. 현재 순자산 ${fmt(p.current_net_worth)}원, 목표 ${fmt(state.goal?.amount ?? 0)}원.`);
+  }
+
+  // 이번 달 goal_override 적용 중이면 항상 안내 — forget 방지 (자동 만료 안 함).
+  if (p && p.needed_per_month_source === 'override') {
+    lines.push(
+      `★ 이 달 목표 오버라이드 적용 중: needed_per_month = ${fmt(p.needed_per_month)}원 (글로벌 산식이라면 ${fmt(p.needed_per_month_formula)}원). 사유: ${p.override_reason}. 해제하려면 delete_entry(entity_type='month_note', id='${state.month}').`
+    );
   }
 
   // 예측 추정 안내.
@@ -673,7 +736,7 @@ async function getState(args: any, data: DataAPI) {
   const month = (args.month as string) || thisMonth();
   const isCurrentMonth = month === thisMonth();
 
-  const [accounts, debts, recurrings, pendings, voucherBalances, goalRaw, monthTxns, settingsRaw] = await Promise.all([
+  const [accounts, debts, recurrings, pendings, voucherBalances, goalRaw, monthTxns, settingsRaw, monthNotesList] = await Promise.all([
     data.list('account:'),
     data.list('debt:'),
     data.list('recurring:'),
@@ -682,7 +745,19 @@ async function getState(args: any, data: DataAPI) {
     data.get('goal'),
     data.list(`txn:${month}:`, 1000),
     data.get('__settings'),
+    data.list('month_note:'),
   ]);
+
+  // 월 메모 맵 + 이번 month 메모 추출.
+  const monthNoteMap: Record<string, MonthNote> = {};
+  for (const r of monthNotesList) {
+    const v = r.value as MonthNote | undefined;
+    if (v?.month) monthNoteMap[v.month] = v;
+  }
+  const thisMonthNote = monthNoteMap[month] || null;
+  const monthNotesRecent = Object.values(monthNoteMap)
+    .sort((a, b) => b.month.localeCompare(a.month))
+    .slice(0, 6);
 
   const allTxns = monthTxns.map(r => r.value as Transaction).filter(Boolean);
 
@@ -806,13 +881,16 @@ async function getState(args: any, data: DataAPI) {
   }
 
   // pace_vs_goal — 월간 페이스(projection 기반) + 전체 누적 페이스 둘 다 노출.
+  // month_note.goal_override 가 이번 달에 있으면 needed_per_month 를 그걸로 덮어씀.
   const goal = goalRaw as Goal | null;
   let pace: any = null;
   if (goal) {
     const end = Date.parse(goal.deadline + 'T00:00:00Z');
     const monthsLeft = Math.max(1, Math.round((end - Date.now()) / (30 * 86400000)));
     const remaining = Math.max(0, goal.amount - netWorth);
-    const neededPerMonth = Math.round(remaining / monthsLeft);
+    const formulaNeededPerMonth = Math.round(remaining / monthsLeft);
+    const override = thisMonthNote?.goal_override;
+    const neededPerMonth = override ? override.needed_per_month : formulaNeededPerMonth;
     const start = Date.parse(goal.created_at);
     const monthsTotal = Math.max(1, Math.round((end - start) / (30 * 86400000)));
     const expectedSavings = goal.amount * (1 - monthsLeft / monthsTotal);
@@ -824,6 +902,9 @@ async function getState(args: any, data: DataAPI) {
       months_left: monthsLeft,
       remaining,
       needed_per_month: neededPerMonth,
+      needed_per_month_source: override ? 'override' : 'formula',
+      needed_per_month_formula: formulaNeededPerMonth,    // 참고용 — override 있을 때 글로벌 산식 값이 얼마였는지
+      override_reason: override?.reason,                  // override 일 때만 채워짐
       current_net_worth: netWorth,
       current_month_pl: currentMonthPl,
       projected_month_pl: projectedMonthPl,
@@ -867,6 +948,8 @@ async function getState(args: any, data: DataAPI) {
     },
     month_forecast: monthForecast,
     pace_vs_goal: pace,
+    this_month_note: thisMonthNote,         // 현재 month 의 회고 메모 + goal_override (있으면)
+    month_notes_recent: monthNotesRecent,   // 최근 6개월 메모 — 회고 / 추세 파악용
     recent_transactions: recent,
     pending: pendingItems,
     voucher_balances: voucherBalanceMap,
@@ -1063,6 +1146,57 @@ async function listTransactions(args: any, data: DataAPI) {
   };
 }
 
+async function setMonthNote(args: any, data: DataAPI) {
+  const month = args.month as string;
+  if (!month || !/^\d{4}-\d{2}$/.test(month)) {
+    throw new Error('month 는 YYYY-MM 형식이어야 합니다 (예: 2026-05).');
+  }
+  const note = args.note as string | undefined;
+  const goalOverride = args.goal_override as { needed_per_month?: any; reason?: string } | undefined;
+
+  if (!note && !goalOverride) {
+    throw new Error('note 또는 goal_override 중 하나는 있어야 합니다. 둘 다 지우려면 delete_entry(entity_type=\'month_note\', id=YYYY-MM).');
+  }
+
+  let parsedOverride: MonthNote['goal_override'] | undefined;
+  if (goalOverride) {
+    const npm = Number(goalOverride.needed_per_month);
+    if (!Number.isFinite(npm) || npm < 0) {
+      throw new Error('goal_override.needed_per_month 는 0 이상의 숫자여야 합니다.');
+    }
+    if (!goalOverride.reason || typeof goalOverride.reason !== 'string') {
+      throw new Error('goal_override.reason (사유) 가 필요합니다 — 나중에 본인도 잊습니다.');
+    }
+    parsedOverride = { needed_per_month: Math.round(npm), reason: goalOverride.reason };
+  }
+
+  const key = `month_note:${month}`;
+  const cur = (await data.get(key)) as MonthNote | null;
+  // setup_state 패턴 — overwrite. 부분 갱신은 update_entry, 삭제는 delete_entry.
+  const next: MonthNote = {
+    month,
+    note: note ?? undefined,
+    goal_override: parsedOverride,
+    created_at: cur?.created_at || now(),
+    updated_at: now(),
+  };
+  await data.set(key, next);
+
+  const lines: string[] = [];
+  const verb = cur ? '갱신' : '등록';
+  lines.push(`${month} 월 메모 ${verb} 완료.`);
+  if (next.note) lines.push(`메모: ${next.note}`);
+  if (next.goal_override) {
+    lines.push(`목표 오버라이드: 이 달 needed_per_month = ${fmt(next.goal_override.needed_per_month)}원 (사유: ${next.goal_override.reason})`);
+    lines.push(`★ 이 달 페이스 계산은 글로벌 산식 대신 이 값을 씁니다. 자동 만료 없음 — 해제하려면 delete_entry(entity_type='month_note', id='${month}') 또는 set_month_note 재호출 (goal_override 빼고 note 만).`);
+  }
+  if (cur && cur.goal_override && !parsedOverride) {
+    lines.push(`(이전 goal_override 가 이번 호출에서 제거됨 — overwrite 정책. 보존하려면 update_entry 사용.)`);
+  }
+
+  return { text: lines.join('\n'), month_note: next };
+}
+
 async function dailyBriefing(data: DataAPI) {
   const state: any = await getState({}, data);
 
@@ -1090,12 +1224,26 @@ async function renderBoard(args: any, data: DataAPI) {
     .join('');
 
   const p = state.pace_vs_goal;
+  const overrideTag = p?.needed_per_month_source === 'override'
+    ? ` <span style="color:#c8a85a;font-size:11px">[override]</span>`
+    : '';
   const goalBlock = state.goal ? `
     <div><strong>목표</strong> ${fmt(state.goal.amount)} by ${state.goal.deadline}
     <br><small style="color:#888">${escapeHtml(state.goal.rationale || '')}</small>
     <br>순자산 ${fmt(state.net_worth)} (${Math.round((state.net_worth / state.goal.amount) * 100)}%)
-    ${p ? `<br><small style="color:${p.cumulative_on_track ? '#7c7' : '#e77'}">${p.cumulative_on_track ? '✓ 누적 진척 OK' : `✗ 누적 진척 미달 (월 ${fmt(p.needed_per_month)}원 페이스 필요)`}</small>` : ''}
+    ${p ? `<br><small style="color:${p.cumulative_on_track ? '#7c7' : '#e77'}">${p.cumulative_on_track ? '✓ 누적 진척 OK' : `✗ 누적 진척 미달 (월 ${fmt(p.needed_per_month)}원 페이스 필요${overrideTag})`}</small>` : ''}
     </div>` : '<div style="color:#888">목표 미설정.</div>';
+
+  // 이번 달 메모 + override — 위젯 상단에 노출 (forget 방지).
+  const tmn = state.this_month_note;
+  const monthNoteBlock = tmn ? `
+    <div style="background:#2a2a3a;padding:10px;border-left:3px solid #a0c8ff;border-radius:4px;margin-bottom:12px;font-size:13px;line-height:1.6">
+      <strong style="color:#a0c8ff">${escapeHtml(month)} 메모</strong>
+      ${tmn.note ? `<br>${escapeHtml(tmn.note)}` : ''}
+      ${tmn.goal_override ? `
+      <br><span style="color:#c8a85a">목표 오버라이드: 이 달 needed_per_month = ${fmt(tmn.goal_override.needed_per_month)}원
+      <br><small>사유: ${escapeHtml(tmn.goal_override.reason)} · 글로벌 산식이라면 ${fmt(p?.needed_per_month_formula ?? 0)}원</small></span>` : ''}
+    </div>` : '';
 
   const fc = state.month_forecast;
   const forecastBlock = fc ? (() => {
@@ -1171,6 +1319,7 @@ input[type=month]{background:#333;color:#eee;border:1px solid #444;padding:4px 8
 </style></head><body>
 <input type="month" id="m" value="${month}">
 ${nagBlock}
+${monthNoteBlock}
 <div class="row">
   <div class="col"><h2>쓸 수 있는 돈</h2><div class="big">${fmt(state.spendable)}</div>
     <small style="color:#888">자산 ${fmt(state.total_assets)} − 부채 ${fmt(state.total_debt)} − 할당 ${fmt(state.total_allocated)}</small></div>
