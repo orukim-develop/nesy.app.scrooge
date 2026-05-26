@@ -50,17 +50,22 @@ export async function run({ input, data }: {
   const args = input.args ?? {};
 
   switch (tool) {
+    // ─── [예산] 앞으로 얼마 쓸 수 있나 ───────────────────────────────
     case 'setup_state': return setupState(args, data);
+    case 'add_recurring': return addRecurring(args, data);
+    case 'set_month_note': return setMonthNote(args, data);
+    case 'transfer_budget': return transferBudget(args, data);
+    // ─── [결산] 실제로 어디에 썼나 ─────────────────────────────────
     case 'record_transaction': return recordTransaction(args, data);
     case 'record_voucher_use': return recordVoucherUse(args, data);
     case 'reconcile_bank_statement': return reconcileBankStatement(args, data);
     case 'resolve_pending': return resolvePending(args, data);
-    case 'add_recurring': return addRecurring(args, data);
+    case 'list_transactions': return listTransactions(args, data);
     case 'update_entry': return updateEntry(args, data);
     case 'delete_entry': return deleteEntry(args, data);
-    case 'list_transactions': return listTransactions(args, data);
-    case 'set_month_note': return setMonthNote(args, data);
+    // ─── [공통] 페이스 점검 ──────────────────────────────────────
     case 'get_state': return getState(args, data);
+    // ─── [배경] ─────────────────────────────────────────────────
     case 'daily_briefing': return dailyBriefing(data);
     case 'render_board': return renderBoard(args, data);
     default: throw new Error(`알 수 없는 함수: ${tool}.`);
@@ -703,6 +708,16 @@ function scroogeNag(state: any, intensity: string): string[] {
     );
   }
 
+  // 처리 예정일 지난 recurring 누락 안내 — 명시 라인.
+  if (fc?.recurring_missing_this_month?.length > 0) {
+    const items = fc.recurring_missing_this_month
+      .map((m: any) => `${m.name}(${m.day_of_month}일, ${fmt(m.amount)}원)`)
+      .join(', ');
+    lines.push(
+      `★ 이번 달 처리 예정일이 지난 정기 항목 ${fc.recurring_missing_this_month.length}건: ${items}. 정말 누락이면 record_transaction(..., recurring_id='해당id'). 이미 입력했는데 recurring_id 가 비었던 거라면 update_entry(entity_type='transaction', month='${state.month}', id='거래id', patch={recurring_id:'해당id'}). 자세히는 month_forecast.recurring_missing_this_month.`
+    );
+  }
+
   // 예측 추정 안내.
   if (fc?.estimation_notes?.length) {
     for (const note of fc.estimation_notes) lines.push(note);
@@ -755,9 +770,13 @@ async function getState(args: any, data: DataAPI) {
     if (v?.month) monthNoteMap[v.month] = v;
   }
   const thisMonthNote = monthNoteMap[month] || null;
-  const monthNotesRecent = Object.values(monthNoteMap)
-    .sort((a, b) => b.month.localeCompare(a.month))
-    .slice(0, 6);
+  const monthNotesAll = Object.values(monthNoteMap).sort((a, b) => b.month.localeCompare(a.month));
+  const monthNotesRecent = monthNotesAll.slice(0, 6);
+  const monthNotesMeta = {
+    limit: 6,
+    total: monthNotesAll.length,
+    is_partial: monthNotesAll.length > 6,
+  };
 
   const allTxns = monthTxns.map(r => r.value as Transaction).filter(Boolean);
 
@@ -778,17 +797,64 @@ async function getState(args: any, data: DataAPI) {
   const currentMonthPl = totalIncome - totalExpense;
 
   const recurringItems = recurrings.map(r => r.value as Recurring).filter(Boolean);
+  const sinkingFunds = recurringItems.filter(r => r.kind === 'sinking_fund');
+
+  // sinking_fund 동적 commit 재계산 — 이번 연도에 이미 결제된 부분 빼고 남은 개월 수로 분할.
+  // sinking_fund 가 등록되어 있고 이번 달 조회일 때만 추가 list 호출 (조건부 비용).
+  let yearTxns: Transaction[] = [];
+  let monthsLeftInYear = 12;
+  let currentYear = new Date().getUTCFullYear();
+  if (sinkingFunds.length > 0 && isCurrentMonth) {
+    const nowD = new Date();
+    currentYear = nowD.getUTCFullYear();
+    const currentMon = nowD.getUTCMonth() + 1;  // 1-12
+    monthsLeftInYear = 13 - currentMon;          // 5월이면 8 (5~12월 포함)
+    const yearRows = await data.list(`txn:${currentYear}-`, 5000);
+    yearTxns = yearRows.map(r => r.value as Transaction).filter(Boolean);
+  }
+
   const allocations: Array<{ name: string; monthly: number; kind: string }> = [];
   let totalAllocated = 0;
   let sinkingFundMonthlyCommit = 0;
   let sinkingFundAnnualTotal = 0;
+  const sinkingFundBreakdown: Array<{
+    id: string; name: string; annual_amount: number;
+    paid_this_year: number; paid_count: number; remaining: number;
+    months_left_in_year: number; monthly_commit: number;
+  }> = [];
+
   for (const r of recurringItems) {
     if (r.kind === 'sinking_fund') {
-      const m = Math.round(r.amount / 12);
-      allocations.push({ name: r.name, monthly: m, kind: 'sinking_fund' });
-      totalAllocated += m;
-      sinkingFundMonthlyCommit += m;
+      let monthlyCommit: number;
+      let paidThisYear = 0, paidCount = 0, remaining = r.amount;
+      if (isCurrentMonth && yearTxns.length >= 0) {
+        // 이번 연도에 recurring_id 가 이 sf 인 expense / card_payment 합산.
+        const matched = yearTxns.filter(t =>
+          t.recurring_id === r.id && (t.type === 'expense' || t.type === 'card_payment')
+        );
+        paidThisYear = matched.reduce((s, t) => s + t.amount, 0);
+        paidCount = matched.length;
+        remaining = Math.max(0, r.amount - paidThisYear);
+        monthlyCommit = monthsLeftInYear > 0 ? Math.round(remaining / monthsLeftInYear) : 0;
+      } else {
+        // 과거 달 조회 등 — 단순 annual/12 fallback.
+        monthlyCommit = Math.round(r.amount / 12);
+        remaining = r.amount;
+      }
+      allocations.push({ name: r.name, monthly: monthlyCommit, kind: 'sinking_fund' });
+      totalAllocated += monthlyCommit;
+      sinkingFundMonthlyCommit += monthlyCommit;
       sinkingFundAnnualTotal += r.amount;
+      if (isCurrentMonth) {
+        sinkingFundBreakdown.push({
+          id: r.id, name: r.name,
+          annual_amount: r.amount,
+          paid_this_year: paidThisYear, paid_count: paidCount,
+          remaining,
+          months_left_in_year: monthsLeftInYear,
+          monthly_commit: monthlyCommit,
+        });
+      }
     } else if (r.kind === 'expense') {
       allocations.push({ name: r.name, monthly: r.amount, kind: 'expense' });
       totalAllocated += r.amount;
@@ -818,6 +884,7 @@ async function getState(args: any, data: DataAPI) {
     const upcoming: Array<{
       id: string; name: string; amount: number; kind: string;
       day_of_month?: number; estimated: boolean; base_amount?: number;
+      category?: string; account_id?: string;
     }> = [];
     let proratedCount = 0;
     let upcomingExpense = 0, upcomingIncome = 0;
@@ -831,6 +898,7 @@ async function getState(args: any, data: DataAPI) {
         upcoming.push({
           id: rec.id, name: rec.name, amount: rec.amount, kind: rec.kind,
           day_of_month: rec.day_of_month, estimated: false,
+          category: rec.category, account_id: rec.account_id,
         });
         if (rec.kind === 'expense') upcomingExpense += rec.amount;
         else if (rec.kind === 'income') upcomingIncome += rec.amount;
@@ -840,6 +908,7 @@ async function getState(args: any, data: DataAPI) {
         upcoming.push({
           id: rec.id, name: rec.name, amount: prorated, kind: rec.kind,
           estimated: true, base_amount: rec.amount,
+          category: rec.category, account_id: rec.account_id,
         });
         if (rec.kind === 'expense') upcomingExpense += prorated;
         else if (rec.kind === 'income') upcomingIncome += prorated;
@@ -852,17 +921,31 @@ async function getState(args: any, data: DataAPI) {
     const projectedMonthEndPl = currentMonthPl + projectedInflow - projectedOutflow;
     const projectedMonthEndNetWorth = netWorth + projectedInflow - projectedOutflow;
 
+    // 처리 예정일 지났는데 매칭 없는 항목 — 구조화 필드 + 텍스트 양쪽 노출.
+    const recurringMissingThisMonth = upcoming
+      .filter(u => u.day_of_month && u.day_of_month <= todayDay)
+      .map(u => ({
+        id: u.id, name: u.name, day_of_month: u.day_of_month, amount: u.amount,
+        kind: u.kind, category: u.category, account_id: u.account_id,
+      }));
+
     const estimationNotes: string[] = [];
     if (proratedCount > 0) {
       estimationNotes.push(
-        `정기 항목 ${proratedCount}건이 day_of_month 미설정 — 비례 배분으로 추정. 정확한 날짜가 있으면 add_recurring 또는 update_entry 로 day_of_month 를 채워주세요.`
+        `정기 항목 ${proratedCount}건이 day_of_month 미설정 — 비례 배분으로 추정. 정확도 ↑ 하려면 update_entry(entity_type='recurring', id='해당id', patch={day_of_month: N}).`
       );
     }
-    const missedRecurring = upcoming.filter(u => u.day_of_month && u.day_of_month <= todayDay);
-    if (missedRecurring.length > 0) {
+    if (recurringMissingThisMonth.length > 0) {
       estimationNotes.push(
-        `이번 달 처리 예정일(${missedRecurring.map(m => m.day_of_month).join(', ')}) 이 지났는데 recurring_id 매칭 거래가 없는 항목 ${missedRecurring.length}건. 이미 처리됐다면 update_entry 로 해당 거래에 recurring_id 를 채워주세요.`
+        `이번 달 처리 예정일(${recurringMissingThisMonth.map(m => m.day_of_month).join(', ')}) 이 지났는데 recurring_id 매칭 거래가 없는 항목 ${recurringMissingThisMonth.length}건 — 자세히는 month_forecast.recurring_missing_this_month. 이미 처리됐다면 update_entry(entity_type='transaction', month='${month}', id='거래id', patch={recurring_id:'해당id'}) 로 매칭. 진짜 누락이면 record_transaction(..., recurring_id:'해당id').`
       );
+    }
+    for (const b of sinkingFundBreakdown) {
+      if (b.paid_this_year > 0) {
+        estimationNotes.push(
+          `${b.name} (sinking_fund) — 연 ${fmt(b.annual_amount)} 중 ${fmt(b.paid_this_year)} 결제됨 (${b.paid_count}건). 남은 ${fmt(b.remaining)}원을 ${b.months_left_in_year}개월(이번 달 포함) 동안 월 ${fmt(b.monthly_commit)}원 페이스로 차감.`
+        );
+      }
     }
 
     monthForecast = {
@@ -870,8 +953,11 @@ async function getState(args: any, data: DataAPI) {
       days_in_month: daysInMonth,
       days_remaining: daysRemaining,
       upcoming_recurring: upcoming,
+      recurring_missing_this_month: recurringMissingThisMonth,
+      recurring_processed_count: processedRecurringIds.size,
       sinking_fund_monthly_commit: sinkingFundMonthlyCommit,
       sinking_fund_annual_total: sinkingFundAnnualTotal,
+      sinking_fund_breakdown: sinkingFundBreakdown,
       projected_outflow: projectedOutflow,
       projected_inflow: projectedInflow,
       projected_month_end_pl: projectedMonthEndPl,
@@ -928,6 +1014,37 @@ async function getState(args: any, data: DataAPI) {
     .sort((a, b) => b.date.localeCompare(a.date) || b.created_at.localeCompare(a.created_at))
     .slice(0, 10);
 
+  // 부분 응답에는 _meta 형제 필드 — 호출 AI 가 "이게 전체야?" 헷갈리지 않게.
+  const recentTransactionsMeta = {
+    limit: 10,
+    returned: recent.length,
+    total_this_month: allTxns.length,
+    is_partial: allTxns.length > recent.length,
+    note: '최근 10건만. 전체는 list_transactions(month=\'YYYY-MM\', ...) 로 조회.',
+  };
+  const pendingMeta = {
+    returned: pendingItems.length,
+    total: pendingItems.length,  // pending 은 전체를 항상 노출 — cap (1000) 닿으면 그때만 잘림 (현실적으로 도달 안 함).
+  };
+
+  // process_hints — 호출 AI 가 응답 받자마자 "다음 어느 도구 부를지" 결정 가능.
+  const processHints = {
+    budget_pace: pace
+      ? (pace.month_on_track === false
+        ? `pace_vs_goal.month_on_track=false. 부족분 ${fmt(pace.month_shortfall)}원. 한시 완화는 set_month_note(goal_override), 다른 달에서 끌어오기는 transfer_budget.`
+        : 'pace_vs_goal.month_on_track=true — 페이스 OK. 별도 조치 불필요.')
+      : 'goal 미설정 — setup_state 로 등록.',
+    reconciliation_health: pendingItems.length > 0
+      ? `pending=${pendingItems.length}건. resolve_pending(pending_id, action) 으로 처리 필요.`
+      : 'pending 큐 비어 있음 — 결산 깨끗함.',
+    recent_activity: recentTransactionsMeta.is_partial
+      ? `recent_transactions 는 최근 10건. 이번 달 전체 ${allTxns.length}건 — 전체 조회는 list_transactions(month='${month}').`
+      : `recent_transactions 가 이번 달 전체 (${allTxns.length}건).`,
+    recurring_health: monthForecast?.recurring_missing_this_month?.length > 0
+      ? `처리 예정일 지났는데 매칭 없는 정기 항목 ${monthForecast.recurring_missing_this_month.length}건. 누락이면 record_transaction(recurring_id 채워서), 입력했는데 id 만 빠진 거면 update_entry.`
+      : '정기 항목 누락 없음.',
+  };
+
   const result = {
     month,
     goal,
@@ -950,10 +1067,14 @@ async function getState(args: any, data: DataAPI) {
     pace_vs_goal: pace,
     this_month_note: thisMonthNote,         // 현재 month 의 회고 메모 + goal_override (있으면)
     month_notes_recent: monthNotesRecent,   // 최근 6개월 메모 — 회고 / 추세 파악용
+    month_notes_meta: monthNotesMeta,       // {limit, total, is_partial} — 6개월보다 더 있는지
     recent_transactions: recent,
+    recent_transactions_meta: recentTransactionsMeta,  // {limit, returned, total_this_month, is_partial, note}
     pending: pendingItems,
+    pending_meta: pendingMeta,
     voucher_balances: voucherBalanceMap,
     recurring: recurringItems,
+    process_hints: processHints,            // 다음 액션 안내 — 호출 AI 가 그대로 인용 가능.
   };
 
   const intensity = (settingsRaw as any)?.nag_intensity || '보통';
@@ -1195,6 +1316,104 @@ async function setMonthNote(args: any, data: DataAPI) {
   }
 
   return { text: lines.join('\n'), month_note: next };
+}
+
+async function transferBudget(args: any, data: DataAPI) {
+  const fromMonths = (args.from_months as string[]) || [];
+  const toMonth = args.to_month as string;
+  const amount = Number(args.amount);
+  const reason = args.reason as string;
+
+  if (!fromMonths.length) throw new Error('from_months 는 최소 1개의 YYYY-MM 이 필요합니다 (배열).');
+  if (!toMonth || !/^\d{4}-\d{2}$/.test(toMonth)) throw new Error('to_month 는 YYYY-MM 형식이어야 합니다 (예: 2026-06).');
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error('amount 는 양의 정수여야 합니다.');
+  if (!reason) throw new Error('reason 이 필요합니다 — 모든 달의 month_note 에 같이 기록됩니다 (나중에 본인도 잊습니다).');
+  for (const fm of fromMonths) {
+    if (!/^\d{4}-\d{2}$/.test(fm)) throw new Error(`from_months 의 '${fm}' 가 YYYY-MM 형식이 아닙니다.`);
+    if (fm === toMonth) throw new Error(`from_months 에 to_month (${toMonth}) 와 같은 달이 있습니다.`);
+  }
+
+  // 글로벌 산식 needed_per_month 를 계산 (호출 시점 기준 — 모든 달에 동일).
+  const [goal, accounts, debts] = await Promise.all([
+    data.get('goal'),
+    data.list('account:'),
+    data.list('debt:'),
+  ]);
+  if (!goal) throw new Error('goal 이 등록되어 있지 않습니다. setup_state 로 먼저 등록하세요.');
+  const totalAssets = accounts.reduce((s, r) => s + ((r.value?.balance) || 0), 0);
+  const totalDebt = debts.reduce((s, r) => s + ((r.value?.balance) || 0), 0);
+  const netWorth = totalAssets - totalDebt;
+  const g = goal as Goal;
+  const end = Date.parse(g.deadline + 'T00:00:00Z');
+  const monthsLeft = Math.max(1, Math.round((end - Date.now()) / (30 * 86400000)));
+  const remaining = Math.max(0, g.amount - netWorth);
+  const formulaNeededPerMonth = Math.round(remaining / monthsLeft);
+
+  const perFromShare = Math.round(amount / fromMonths.length);
+
+  // 각 달의 month_note 에 goal_override 박음 (있으면 갱신, 없으면 신규).
+  const affected: Array<{ month: string; mode: 'tighten' | 'relax'; needed_per_month: number; share: number }> = [];
+
+  // from 들 — 강화 (formula + share).
+  for (const fm of fromMonths) {
+    const key = `month_note:${fm}`;
+    const cur = (await data.get(key)) as MonthNote | null;
+    const newNeeded = formulaNeededPerMonth + perFromShare;
+    const tNote = `transfer_budget: ${toMonth} 로 ${fmt(perFromShare)}원 이월 (사유: ${reason}). 이 달 페이스 강화.`;
+    const mergedNote = cur?.note
+      ? (cur.note.includes('transfer_budget:') ? cur.note : `${cur.note}\n${tNote}`)
+      : tNote;
+    const next: MonthNote = {
+      month: fm,
+      note: mergedNote,
+      goal_override: { needed_per_month: newNeeded, reason },
+      created_at: cur?.created_at || now(),
+      updated_at: now(),
+    };
+    await data.set(key, next);
+    affected.push({ month: fm, mode: 'tighten', needed_per_month: newNeeded, share: perFromShare });
+  }
+
+  // to — 완화 (formula - amount, 최소 0).
+  {
+    const key = `month_note:${toMonth}`;
+    const cur = (await data.get(key)) as MonthNote | null;
+    const newNeeded = Math.max(0, formulaNeededPerMonth - amount);
+    const tNote = `transfer_budget: ${fromMonths.join(', ')} 에서 ${fmt(amount)}원 끌어옴 (사유: ${reason}). 이 달 페이스 완화.`;
+    const mergedNote = cur?.note
+      ? (cur.note.includes('transfer_budget:') ? cur.note : `${cur.note}\n${tNote}`)
+      : tNote;
+    const next: MonthNote = {
+      month: toMonth,
+      note: mergedNote,
+      goal_override: { needed_per_month: newNeeded, reason },
+      created_at: cur?.created_at || now(),
+      updated_at: now(),
+    };
+    await data.set(key, next);
+    affected.push({ month: toMonth, mode: 'relax', needed_per_month: newNeeded, share: amount });
+  }
+
+  const lines: string[] = [];
+  lines.push(`예산 이월 완료 — ${fromMonths.join(', ')} → ${toMonth}, 총 ${fmt(amount)}원.`);
+  lines.push(`사유: ${reason}`);
+  lines.push(`글로벌 산식 needed_per_month = ${fmt(formulaNeededPerMonth)}원 기준 계산.`);
+  lines.push('');
+  lines.push('[적용 결과 — 각 달 goal_override]');
+  for (const a of affected) {
+    const tag = a.mode === 'tighten' ? '강화' : '완화';
+    const delta = a.mode === 'tighten' ? `+${fmt(a.share)}` : `-${fmt(a.share)}`;
+    lines.push(`${a.month} (${tag}): needed_per_month = ${fmt(a.needed_per_month)}원 (formula ${delta})`);
+  }
+  lines.push('');
+  lines.push(`★ 자동 해제 없음. 풀려면 각 달 delete_entry(entity_type='month_note', id='YYYY-MM'). 일부만 풀어도 다른 달은 그대로 남으니 일관성은 사용자 책임.`);
+
+  return {
+    text: lines.join('\n'),
+    affected,
+    formula_needed_per_month: formulaNeededPerMonth,
+    total_amount: amount,
+  };
 }
 
 async function dailyBriefing(data: DataAPI) {

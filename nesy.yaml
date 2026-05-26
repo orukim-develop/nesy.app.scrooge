@@ -1,17 +1,19 @@
 tools:
+  # ════════════════════════════════════════════════════════════
+  # [예산] 앞으로 얼마 쓸 수 있나
+  # ════════════════════════════════════════════════════════════
+
   - name: setup_state
     description: |
-      초기 재무 상태(자산 계좌, 부채, 저축 목표)를 등록합니다.
-      처음 마도서를 쓸 때, 또는 새 계좌·부채를 추가할 때 호출하세요.
+      [예산·1단계] 초기 자산 / 부채 / 저축 목표 스냅샷을 등록합니다. 처음 마도서를 쓸 때, 또는 새 계좌·부채를 추가할 때 호출.
 
-      ★ 중요 — 동작 모델 ★
-      이 도구는 **현재 시점 잔액을 강제 덮어쓰기** 합니다.
+      ★ 동작 모델 — **현재 시점 잔액 강제 덮어쓰기** ★
       - 같은 id 가 이미 존재하면 balance 가 그대로 덮어집니다. 거래 이력을 replay 하지 않습니다.
-      - 따라서 "5/1 시점 opening balance 박고 5월 거래로 누적시켜 현재 잔고 계산" 같은 모델은 작동하지 않습니다.
-      - 이미 등록된 계좌·부채의 잔고를 보정하고 싶다면 setup_state 를 다시 부르지 말고 update_entry 를 사용하세요.
+      - "5/1 시점 opening balance 박고 5월 거래로 누적시켜 현재 잔고 계산" 같은 모델은 작동하지 않습니다.
+      - 잔고 보정용으로는 setup_state 를 다시 부르지 말고 update_entry 를 사용하세요.
       - 일상 거래는 record_transaction 으로 — 그건 기존 잔고에 누적합니다.
 
-      goal.rationale 은 "왜 그 금액·기한인지" 의 메모입니다 — 반드시 받아두세요 (시간 지나면 본인도 잊습니다).
+      goal.rationale 은 "왜 그 금액·기한인지" 메모 — 반드시 받아두세요 (시간 지나면 본인도 잊습니다).
       과거 거래 마이그레이션은 기본이 아닙니다 — 오늘 시점 스냅샷만 받고, 이후 거래는 record_transaction 으로 누적하거나 reconcile_bank_statement 로 한꺼번에 대조하세요.
     inputSchema:
       type: object
@@ -34,9 +36,120 @@ tools:
             { amount, deadline (YYYY-MM-DD), rationale }.
             rationale 은 필수 메모 — "퇴직 전까지 비상금 6개월치" 같은 산출 근거.
 
+  - name: add_recurring
+    description: |
+      [예산·2단계] 정기 지출·수입 또는 sinking fund 를 등록합니다.
+      kind=expense: 월세·통신비 같은 매월 고정비. 매월 예산에 자동 할당.
+      kind=income: 월급 등 정기 수입.
+      kind=sinking_fund: 연 1회 자동차세, 분기별 보험, 명절 비용 같은 비정기 큰 지출 — annual_amount/12 만큼 매월 미리 할당. 일부를 미리 결제하면 마도서가 동적으로 남은 금액을 남은 개월로 재분할 (sinking_fund_breakdown 참고).
+      "쓸 수 있는 돈" = 자산 - 부채 - 할당분 — 이 계산이 정확하려면 등록이 필수입니다.
+
+      ※ 현재 자동 실행은 하지 않습니다 — 매월 실제 지출은 사용자가 record_transaction 으로 직접 기록해야 합니다. recurring 은 예산 할당 계획 (spendable / month_forecast 계산용) 으로 사용됩니다.
+
+      ★ 반환된 id 를 기억해두세요. 이후 사용자가 이 정기 항목의 이번 달 거래를 입력할 때 (예: "월세 빠졌어") record_transaction 에 recurring_id 로 같이 넘기면 month_forecast 가 정확해집니다.
+
+      ★ day_of_month 는 가능하면 채우세요. 없으면 month_forecast 가 비례 배분으로 추정합니다 (정확도 떨어짐).
+    inputSchema:
+      type: object
+      properties:
+        name:
+          type: string
+        amount:
+          type: integer
+          description: kind=expense/income 이면 월 금액. kind=sinking_fund 면 연 금액.
+        kind:
+          type: string
+          description: expense | income | sinking_fund
+        cadence:
+          type: string
+          description: monthly | yearly | quarterly.
+        day_of_month:
+          type: integer
+          description: 월 며칠 (예 25 = 월급일). 가능한 한 채워주세요 — 없으면 month_forecast 가 비례 배분 추정으로 떨어집니다.
+        category:
+          type: string
+        account_id:
+          type: string
+      required: [name, amount, kind]
+
+  - name: set_month_note
+    description: |
+      [예산·3단계] 특정 달에 대한 회고 메모 또는 목표 페이스 오버라이드를 등록합니다.
+      "5월에 장례식 때문에 목표 미달이었어, 6-7월은 needed_per_month 30만원으로 고정", "9월은 추석이라 지출 폭증 예정" 같은 한 달짜리 사건·회고를 박을 때 호출.
+
+      ★ 동작 모델 ★
+      같은 달에 다시 호출하면 **덮어쓰기** 입니다 (note 와 goal_override 둘 다). 부분 수정은 update_entry(entity_type='month_note', id=YYYY-MM, patch={...}) 사용.
+      만료 자동화는 없습니다 — 한시 오버라이드는 사용자가 직접 delete_entry 로 해제해야 합니다. 마도서가 nag 와 위젯 메모 블록에 "오버라이드 적용 중" 을 띄워 잊지 않게 합니다.
+
+      ※ 여러 달 묶음 이월·땡겨오기는 transfer_budget 을 사용하세요 — 자동으로 from / to 들의 month_note 일관성 박아 줍니다.
+
+      ★ note ★
+      자유 텍스트. 회고·이벤트 메모. 예: "장례비 200만 이연, 8월에 재조정". get_state 와 위젯에 노출.
+
+      ★ goal_override ★
+      이 달에만 pace_vs_goal.needed_per_month 를 글로벌 산식 (remaining / monthsLeft) 대신 지정 값으로 강제 덮어쓰기.
+      `needed_per_month` (정수, KRW) + `reason` (필수 — 왜 오버라이드인지) 모두 필요.
+      예: { needed_per_month: 300000, reason: "장례비 이연으로 6-7월 한시 완화, 8월 재조정" }.
+      오버라이드 해제는 delete_entry(entity_type='month_note', id='YYYY-MM') 또는 update_entry 의 patch={goal_override: null}.
+
+      note 또는 goal_override 중 **하나 이상은 필수**입니다.
+    inputSchema:
+      type: object
+      properties:
+        month:
+          type: string
+          description: YYYY-MM. 메모를 박을 달.
+        note:
+          type: string
+          description: 자유 회고 메모.
+        goal_override:
+          type: object
+          description: |
+            { needed_per_month (정수), reason (문자열) }. 이 달 needed_per_month 를 산식 대신 이 값으로 강제.
+            한시 완화든 강화든 사용 가능. reason 은 필수 — 왜 오버라이드인지 기록해야 나중에 본인이 이해할 수 있습니다.
+      required: [month]
+
+  - name: transfer_budget
+    description: |
+      [예산·3단계] 여러 달에 걸친 예산 이월·땡겨오기. 한 달의 갑작스러운 큰 지출을 다른 달(들)의 예산에서 평준화할 때 호출.
+
+      ★ 예시 시나리오 ★
+      "어머니 용돈 50만 6월에 갑자기 발생. 7·8월 예산에서 25만씩 끌어와 6월 페이스 완화."
+      → transfer_budget(from_months=['2026-07','2026-08'], to_month='2026-06', amount=500000, reason='어머니 용돈')
+
+      ★ 동작 모델 ★
+      - 호출 시점의 글로벌 산식 needed_per_month = (remaining / monthsLeft) 계산.
+      - from_months 각각의 goal_override = formula + (amount / N) 로 **강화** (그 달은 더 빡빡).
+      - to_month 의 goal_override = max(0, formula - amount) 로 **완화** (그 달은 여유).
+      - 각 달의 month_note 에 transfer_budget 안내 텍스트 자동 추가 (사유 + 방향).
+      - 사용자가 set_month_note 를 직접 N번 호출하는 것과 동일한 효과지만 산식 계산 + 일관성을 마도서가 책임지므로 호출 AI 가 산식·연쇄호출에서 헛다리 짚지 않습니다.
+
+      ★ 해제 ★
+      자동 해제 없음. 각 달 개별로 delete_entry(entity_type='month_note', id='YYYY-MM'). 일부만 해제하면 다른 달은 그대로 남으니 일관성은 사용자 책임.
+    inputSchema:
+      type: object
+      properties:
+        from_months:
+          type: array
+          description: 예산을 끌어올 달들 (YYYY-MM 배열, 1개 이상). 각 달은 (amount / N) 만큼 강화됨.
+        to_month:
+          type: string
+          description: 예산을 받을 달 (YYYY-MM). amount 만큼 완화됨.
+        amount:
+          type: integer
+          description: 이월할 총액 (KRW 정수). from_months 에 균등 배분됨.
+        reason:
+          type: string
+          description: 사유 — 모든 달의 month_note 에 같이 기록됩니다. "어머니 용돈", "장례비 이연" 등 본인이 나중에 봐도 이해할 메모.
+      required: [from_months, to_month, amount, reason]
+
+  # ════════════════════════════════════════════════════════════
+  # [결산] 실제로 어디에 썼나
+  # ════════════════════════════════════════════════════════════
+
   - name: record_transaction
     description: |
-      개별 거래 1건을 기록합니다. "점심 만원 썼어", "월급 들어왔어", "통장에서 적금으로 30만원" 같은 일상 거래 입력에 사용.
+      [결산·1단계] 개별 거래 1건을 기록합니다. "점심 만원 썼어", "월급 들어왔어", "통장에서 적금으로 30만원" 같은 일상 거래 입력에 사용.
 
       ★ 동작 모델 ★
       거래 row 를 영구 저장하고, **그 1건의 효과를 기존 balance 에 누적**합니다. 잔고를 덮어쓰지 않습니다.
@@ -45,7 +158,7 @@ tools:
       잔고 자체를 강제 조정해야 하는 경우 (마도서 잔고가 실제 통장과 어긋났을 때 등) 에는 가짜 거래를 박지 말고 update_entry 로 직접 balance 를 덮어쓰세요.
 
       ★ recurring_id ★
-      이 거래가 등록된 recurring (월세, 차량할부, 월급 등) 의 이번 달 인스턴스라면 **반드시 recurring_id 를 채워주세요**. month_forecast 가 "이미 처리됨" 판정에 이 필드를 사용합니다. 누락되면 예측이 같은 항목을 또 차감해 과대 예측이 됩니다.
+      이 거래가 등록된 recurring (월세, 차량할부, 월급, sinking_fund 등) 의 이번 달 인스턴스라면 **반드시 recurring_id 를 채워주세요**. month_forecast 가 "이미 처리됨" 판정에 이 필드를 사용합니다. 누락되면 예측이 같은 항목을 또 차감해 과대 예측이 됩니다. sinking_fund 의 경우엔 누락되면 마도서가 그 결제를 인식하지 못해 monthly_commit 재계산도 안 됩니다.
       매칭 방법: get_state 응답의 `recurring` 배열에서 사용자가 말한 항목(예: "LH 월세") 의 id 를 찾아 채우세요.
 
       type 별 처리:
@@ -86,12 +199,12 @@ tools:
           description: ISO (YYYY-MM-DD). 생략 시 오늘.
         recurring_id:
           type: string
-          description: 이 거래가 등록된 recurring 의 이번 달 인스턴스이면 그 recurring 의 id. get_state 응답의 recurring 배열에서 찾아 채움. 누락되면 month_forecast 가 같은 항목을 또 예측해 과대 예측.
+          description: 이 거래가 등록된 recurring 의 이번 달 인스턴스이면 그 recurring 의 id. get_state 응답의 recurring 배열에서 찾아 채움. 누락되면 month_forecast 가 같은 항목을 또 예측해 과대 예측. sinking_fund 의 경우 monthly_commit 재계산도 안 됨.
       required: [type, amount]
 
   - name: record_voucher_use
     description: |
-      지역상품권·온누리상품권·문화상품권 등 별도 장부로 관리되는 바우처 사용을 기록합니다.
+      [결산·1단계] 지역상품권·온누리상품권·문화상품권 등 별도 장부로 관리되는 바우처 사용을 기록합니다.
       통장·카드와 분리된 장부에 들어가므로 주된 자산·지출 계산을 오염시키지 않습니다.
       "지역상품권으로 만원 썼어" 같은 입력에 호출.
     inputSchema:
@@ -113,7 +226,7 @@ tools:
 
   - name: reconcile_bank_statement
     description: |
-      사용자가 은행·카드 전체 명세를 한 번에 던지면 기존 기록과 대조합니다. 기록되지 않은 거래는 누락 의심으로 잡고, 기록된 금액과 실제 승인 금액이 다르면 (예: 1000 적었지만 할인 받아 950 승인) mismatch 큐에 넣어 보정 여부를 묻습니다.
+      [결산·2단계] 사용자가 은행·카드 전체 명세를 한 번에 던지면 기존 기록과 대조합니다. 기록되지 않은 거래는 누락 의심으로 잡고, 기록된 금액과 실제 승인 금액이 다르면 (예: 1000 적었지만 할인 받아 950 승인) mismatch 큐에 넣어 보정 여부를 묻습니다.
       매칭 규칙: 같은 account_id 의 같은 흐름 방향 (in/out), 날짜 ±1일, 금액 차이 5% 또는 50원 이내.
       auto_add=true 면 누락 거래를 즉시 추가, false (기본) 면 pending 큐로 보내 사용자에게 확인.
       raw 파일은 받지 않습니다 — 호출 AI 가 사용자가 제출한 명세서 사진·엑셀·문자를 파싱해서 transactions 배열로 넘기세요.
@@ -145,7 +258,7 @@ tools:
 
   - name: resolve_pending
     description: |
-      get_state 가 돌려준 pending 항목 (anomaly / missing_txn / amount_mismatch) 에 사용자가 답할 때 호출.
+      [결산·3단계] get_state 가 돌려준 pending 항목 (anomaly / missing_txn / amount_mismatch) 에 사용자가 답할 때 호출.
       action:
       - accept: 인정 (missing_txn → 거래 추가 + 잔고 조정, anomaly → 그대로 인정).
       - correct: 보정 (amount_mismatch → corrected_amount 로 거래 금액 갱신 + 잔고 차액 보정).
@@ -167,120 +280,12 @@ tools:
           type: string
       required: [pending_id, action]
 
-  - name: add_recurring
-    description: |
-      정기 지출·수입 또는 sinking fund 를 등록합니다.
-      kind=expense: 월세·통신비 같은 매월 고정비. 매월 예산에 자동 할당.
-      kind=income: 월급 등 정기 수입.
-      kind=sinking_fund: 연 1회 자동차세, 분기별 보험, 명절 비용 같은 비정기 큰 지출 — annual_amount/12 만큼 매월 미리 할당해서 갑작스러운 큰 지출에 대비.
-      "쓸 수 있는 돈" = 자산 - 부채 - 할당분 — 이 계산이 정확하려면 등록이 필수입니다.
-
-      ※ 현재 자동 실행은 하지 않습니다 — 매월 실제 지출은 사용자가 record_transaction 으로 직접 기록해야 합니다. recurring 은 예산 할당 계획 (spendable / month_forecast 계산용) 으로 사용됩니다.
-
-      ★ 반환된 id 를 기억해두세요. 이후 사용자가 이 정기 항목의 이번 달 거래를 입력할 때 (예: "월세 빠졌어") record_transaction 에 recurring_id 로 같이 넘기면 month_forecast 가 정확해집니다.
-
-      ★ day_of_month 는 가능하면 채우세요. 없으면 month_forecast 가 비례 배분으로 추정합니다 (정확도 떨어짐).
-    inputSchema:
-      type: object
-      properties:
-        name:
-          type: string
-        amount:
-          type: integer
-          description: kind=expense/income 이면 월 금액. kind=sinking_fund 면 연 금액.
-        kind:
-          type: string
-          description: expense | income | sinking_fund
-        cadence:
-          type: string
-          description: monthly | yearly | quarterly.
-        day_of_month:
-          type: integer
-          description: 월 며칠 (예 25 = 월급일). 가능한 한 채워주세요 — 없으면 month_forecast 가 비례 배분 추정으로 떨어집니다.
-        category:
-          type: string
-        account_id:
-          type: string
-      required: [name, amount, kind]
-
-  - name: update_entry
-    description: |
-      이미 기록된 항목을 수정합니다. patch 에 든 필드만 갱신하고 빠진 필드는 그대로 둡니다.
-
-      ★ 동작 모델 ★
-      patch 의 값은 **그대로 덮어쓰기** 입니다. 누적이 아닙니다.
-      예: patch={balance: 5891672} → 기존 balance 가 무엇이었든 5,891,672 로 덮어씀.
-      거래 1건의 영향을 기존 잔고에 누적시키고 싶으면 update_entry 가 아니라 record_transaction 을 사용하세요.
-
-      주요 용도:
-      - **잔고 보정**: 마도서 balance 가 실제 통장과 어긋났을 때 patch={balance: 실잔액} 으로 직접 보정. setup_state 를 다시 부르지 말고 이걸 쓰세요.
-      - **항목 정보 수정**: 정기 항목 금액 변경, 거래 카테고리 정정 등.
-
-      entity_type:
-      - account: 자산 계좌 (잔고 변경 가능 — 잔고 보정의 기본 경로).
-      - debt: 부채 (잔고 변경 가능 — 마통·카드 미결제 보정의 기본 경로).
-      - recurring: 정기·sinking fund. 월세 금액이 바뀌었거나 헬스장을 끊었을 때.
-      - transaction: 개별 거래. 금액·계좌·타입 등 변경 시 자동으로 옛 잔고 영향을 되돌리고 새 영향을 다시 적용합니다 — 잔고 일관성이 유지됩니다.
-      - voucher_use: 바우처 사용. 금액이 바뀌면 바우처 잔액 자동 보정.
-      - month_note: 월별 메모/오버라이드. id 에 YYYY-MM. patch 에 { note, goal_override } 부분 갱신. note=null 이면 메모 제거, goal_override=null 이면 오버라이드 해제 (글로벌 산식 복귀).
-      - goal: 저축 목표.
-
-      transaction 수정 시 month (YYYY-MM, 거래 일자 기준) 필요 — 거래가 월별 폴더에 저장되기 때문입니다.
-      voucher_use 수정 시 voucher_name 필요 — 저장 키가 voucher:{name}:{id} 라서.
-      month_note 의 id 는 YYYY-MM (예: '2026-05').
-      goal 은 id 를 비웁니다 (단일 row).
-    inputSchema:
-      type: object
-      properties:
-        entity_type:
-          type: string
-          description: account | debt | recurring | transaction | voucher_use | goal
-        id:
-          type: string
-          description: 대상 id. goal 은 비움.
-        patch:
-          type: object
-          description: 갱신할 필드 (예 debt 잔고 보정이면 { balance }, transaction 이면 { amount, category, memo }, recurring 이면 { amount, name } 등).
-        month:
-          type: string
-          description: transaction 수정 시 그 거래의 YYYY-MM.
-        voucher_name:
-          type: string
-          description: voucher_use 수정 시 필요.
-      required: [entity_type, patch]
-
-  - name: delete_entry
-    description: |
-      이미 기록된 항목을 삭제합니다.
-      entity_type:
-      - transaction: 잔고 영향 자동 되돌림 (반대 방향 적용 후 삭제). 환불·이중기록·오타 등에 사용.
-      - voucher_use: 바우처 잔액 복원 후 삭제.
-      - recurring: 즉시 미래 할당에서 제외.
-      - month_note: 월별 메모/오버라이드 삭제. id 는 YYYY-MM. goal_override 가 있었다면 그 달 페이스가 글로벌 산식으로 복귀.
-      - account/debt: 단순 삭제. 그 계좌에 묶인 과거 거래의 잔고 정합성은 보장하지 않습니다 — 결과를 이해하고 호출하세요.
-      - goal: 목표 포기/리셋.
-      transaction 은 month, voucher_use 는 voucher_name 이 같이 필요합니다.
-      month_note 의 id 는 YYYY-MM.
-    inputSchema:
-      type: object
-      properties:
-        entity_type:
-          type: string
-          description: account | debt | recurring | transaction | voucher_use | goal
-        id:
-          type: string
-          description: goal 은 비움.
-        month:
-          type: string
-          description: transaction 삭제 시 필요.
-        voucher_name:
-          type: string
-          description: voucher_use 삭제 시 필요.
-      required: [entity_type]
-
   - name: list_transactions
     description: |
-      거래 내역을 필터·정렬해서 조회합니다. "지난주 식비 다 보여줘", "5월에 신한카드로 박힌 거 다", "이번 달 카페에 쓴 돈", "이 거래 뭐였지?", "5/12 에 뭐 산 거야?" 같은 사용자 질문에 호출하세요. read-only — 수정·삭제는 update_entry / delete_entry.
+      [결산·4단계] 거래 내역을 필터·정렬해서 조회합니다. "지난주 식비 다 보여줘", "5월에 신한카드로 박힌 거 다", "이번 달 카페에 쓴 돈", "이 거래 뭐였지?", "5/12 에 뭐 산 거야?" 같은 사용자 질문에 호출하세요. read-only — 수정·삭제는 update_entry / delete_entry.
+
+      ★ get_state.recent_transactions 와의 관계 ★
+      get_state 는 최근 10건만 줍니다 (`recent_transactions_meta.is_partial` 로 표시). 사용자가 "이번 달 전체" 류로 물어보면 반드시 이 도구로 다시 조회하세요. 10건만 보고 "전체" 라고 답하면 안 됨.
 
       ★ 응답 — 두 채널 (text 우선) ★
       - **`text` (메인)**: 거래 한 건씩 풀어 쓴 markdown — `MM-DD 지출/수입/이체/카드값 상호 (카테고리) ±금액 | from/to 계좌이름 "메모" (id: xxxxx)`. 카테고리별·타입별 집계도 같이. **호출 AI 는 이 text 를 보고 사용자에게 답하세요 — id, 금액, 카테고리, merchant, account 이름까지 다 들어있음.**
@@ -336,49 +341,104 @@ tools:
           type: string
           description: 이전 응답의 next_cursor.
 
-  - name: set_month_note
+  - name: update_entry
     description: |
-      특정 달에 대한 회고 메모 또는 목표 페이스 오버라이드를 등록합니다.
-      "5월에 장례식 때문에 목표 미달이었어, 6-7월은 needed_per_month 30만원으로 고정", "9월은 추석이라 지출 폭증 예정" 같은 한 달짜리 사건·회고를 박을 때 호출.
+      [결산·4단계] 이미 기록된 항목을 수정합니다. patch 에 든 필드만 갱신하고 빠진 필드는 그대로 둡니다.
 
       ★ 동작 모델 ★
-      같은 달에 다시 호출하면 **덮어쓰기** 입니다 (note 와 goal_override 둘 다). 부분 수정은 update_entry(entity_type='month_note', id=YYYY-MM, patch={...}) 사용.
-      만료 자동화는 없습니다 — 한시 오버라이드는 사용자가 직접 delete_entry 로 해제해야 합니다. 마도서가 nag 와 위젯 메모 블록에 "오버라이드 적용 중" 을 띄워 잊지 않게 합니다.
+      patch 의 값은 **그대로 덮어쓰기** 입니다. 누적이 아닙니다.
+      예: patch={balance: 5891672} → 기존 balance 가 무엇이었든 5,891,672 로 덮어씀.
+      거래 1건의 영향을 기존 잔고에 누적시키고 싶으면 update_entry 가 아니라 record_transaction 을 사용하세요.
 
-      ★ note ★
-      자유 텍스트. 회고·이벤트 메모. 예: "장례비 200만 이연, 8월에 재조정". get_state 와 위젯에 노출.
+      주요 용도:
+      - **잔고 보정**: 마도서 balance 가 실제 통장과 어긋났을 때 patch={balance: 실잔액} 으로 직접 보정. setup_state 를 다시 부르지 말고 이걸 쓰세요.
+      - **항목 정보 수정**: 정기 항목 금액 변경, 거래 카테고리 정정 등.
+      - **거래에 recurring_id 채우기**: 이미 입력한 거래가 어떤 recurring 의 인스턴스였는데 id 누락된 경우 → patch={recurring_id: '...'} 로 채워야 month_forecast 가 "이미 처리됨" 으로 인식.
 
-      ★ goal_override ★
-      이 달에만 pace_vs_goal.needed_per_month 를 글로벌 산식 (remaining / monthsLeft) 대신 지정 값으로 강제 덮어쓰기.
-      `needed_per_month` (정수, KRW) + `reason` (필수 — 왜 오버라이드인지) 모두 필요.
-      예: { needed_per_month: 300000, reason: "장례비 이연으로 6-7월 한시 완화, 8월 재조정" }.
-      오버라이드 해제는 delete_entry(entity_type='month_note', id='YYYY-MM') 또는 update_entry 의 patch={goal_override: null}.
+      entity_type:
+      - account: 자산 계좌 (잔고 변경 가능 — 잔고 보정의 기본 경로).
+      - debt: 부채 (잔고 변경 가능 — 마통·카드 미결제 보정의 기본 경로).
+      - recurring: 정기·sinking fund. 월세 금액이 바뀌었거나 헬스장을 끊었을 때. day_of_month 채워 넣을 때도 사용.
+      - transaction: 개별 거래. 금액·계좌·타입 등 변경 시 자동으로 옛 잔고 영향을 되돌리고 새 영향을 다시 적용합니다 — 잔고 일관성이 유지됩니다.
+      - voucher_use: 바우처 사용. 금액이 바뀌면 바우처 잔액 자동 보정.
+      - month_note: 월별 메모/오버라이드. id 에 YYYY-MM. patch 에 { note, goal_override } 부분 갱신. note=null 이면 메모 제거, goal_override=null 이면 오버라이드 해제 (글로벌 산식 복귀).
+      - goal: 저축 목표.
 
-      note 또는 goal_override 중 **하나 이상은 필수**입니다.
+      transaction 수정 시 month (YYYY-MM, 거래 일자 기준) 필요 — 거래가 월별 폴더에 저장되기 때문입니다.
+      voucher_use 수정 시 voucher_name 필요 — 저장 키가 voucher:{name}:{id} 라서.
+      month_note 의 id 는 YYYY-MM (예: '2026-05').
+      goal 은 id 를 비웁니다 (단일 row).
     inputSchema:
       type: object
       properties:
+        entity_type:
+          type: string
+          description: account | debt | recurring | transaction | voucher_use | month_note | goal
+        id:
+          type: string
+          description: 대상 id. goal 은 비움.
+        patch:
+          type: object
+          description: 갱신할 필드 (예 debt 잔고 보정이면 { balance }, transaction 이면 { amount, category, memo, recurring_id }, recurring 이면 { amount, name, day_of_month } 등).
         month:
           type: string
-          description: YYYY-MM. 메모를 박을 달.
-        note:
+          description: transaction 수정 시 그 거래의 YYYY-MM.
+        voucher_name:
           type: string
-          description: 자유 회고 메모.
-        goal_override:
-          type: object
-          description: |
-            { needed_per_month (정수), reason (문자열) }. 이 달 needed_per_month 를 산식 대신 이 값으로 강제.
-            한시 완화든 강화든 사용 가능. reason 은 필수 — 왜 오버라이드인지 기록해야 나중에 본인이 이해할 수 있습니다.
-      required: [month]
+          description: voucher_use 수정 시 필요.
+      required: [entity_type, patch]
+
+  - name: delete_entry
+    description: |
+      [결산·4단계] 이미 기록된 항목을 삭제합니다.
+      entity_type:
+      - transaction: 잔고 영향 자동 되돌림 (반대 방향 적용 후 삭제). 환불·이중기록·오타 등에 사용.
+      - voucher_use: 바우처 잔액 복원 후 삭제.
+      - recurring: 즉시 미래 할당에서 제외.
+      - month_note: 월별 메모/오버라이드 삭제. id 는 YYYY-MM. goal_override 가 있었다면 그 달 페이스가 글로벌 산식으로 복귀. transfer_budget 의 해제도 이 도구로 (각 달 개별).
+      - account/debt: 단순 삭제. 그 계좌에 묶인 과거 거래의 잔고 정합성은 보장하지 않습니다 — 결과를 이해하고 호출하세요.
+      - goal: 목표 포기/리셋.
+      transaction 은 month, voucher_use 는 voucher_name 이 같이 필요합니다.
+      month_note 의 id 는 YYYY-MM.
+    inputSchema:
+      type: object
+      properties:
+        entity_type:
+          type: string
+          description: account | debt | recurring | transaction | voucher_use | month_note | goal
+        id:
+          type: string
+          description: goal 은 비움.
+        month:
+          type: string
+          description: transaction 삭제 시 필요.
+        voucher_name:
+          type: string
+          description: voucher_use 삭제 시 필요.
+      required: [entity_type]
+
+  # ════════════════════════════════════════════════════════════
+  # [공통] 페이스 점검
+  # ════════════════════════════════════════════════════════════
 
   - name: get_state
     description: |
-      현재 재무 상태 전체를 반환합니다. 사용자에게 조언·현황 설명을 하기 전에 항상 먼저 호출하세요.
+      [공통] 현재 재무 상태 전체를 반환합니다. 사용자에게 조언·현황 설명을 하기 전에 항상 먼저 호출하세요. 예산 / 결산 양 프로세스의 진입점.
+
+      ★ process_hints 필드 — 다음 액션 안내 ★
+      응답에 `process_hints { budget_pace, reconciliation_health, recent_activity, recurring_health }` 가 포함됩니다. 각 라인이 "다음 어느 도구를 어떤 인자로 부르면 되는지" 알려줍니다 — 호출 AI 는 그대로 인용하거나 풀어 써도 됩니다.
+
+      ★ 부분 응답 — _meta 필드 확인 ★
+      - `recent_transactions` 는 최근 10건만. `recent_transactions_meta.is_partial=true` 면 list_transactions 로 전체 조회. "이번 달 거래 전체" 류 답변할 때 반드시 확인.
+      - `month_notes_recent` 는 최근 6개. `month_notes_meta` 로 총 개수 확인.
+      - `pending` 은 미해결 큐. `pending_meta.total` 확인.
 
       ★ 월 페이스 판단 시 — 반드시 다음 필드 사용 ★
       - `pace_vs_goal.month_on_track` (boolean) → 이번 달 예측 P&L 이 목표 페이스에 도달하는가
       - `pace_vs_goal.projected_month_pl` → 이번 달 최종 예상 net (= 이미 발생한 P&L + 남은 일수 recurring 차감)
       - `month_forecast.upcoming_recurring` → 아직 빠지지 않은 정기 항목 (월세, 차량할부, sinking_fund 등)
+      - `month_forecast.recurring_missing_this_month` → 처리 예정일이 지났는데 매칭 거래 없는 항목 (구조화). 호출 AI 가 이것을 보지 않고 자체 추론으로 누락을 메우면 헛다리.
+      - `month_forecast.sinking_fund_breakdown` → 각 sinking_fund 의 paid_this_year / remaining / monthly_commit. 부분 결제 반영된 동적 값.
       현재 시점 snapshot (net_worth, current_month_pl) 만 보고 "이번 달 페이스 OK" 라고 결론 내리면 안 됩니다 — 남은 일수 정기 지출을 빠뜨려 정반대 결론이 나옵니다.
 
       ★ 발생주의 vs 현금주의 ★
@@ -388,16 +448,20 @@ tools:
 
       반환 필드:
       - accounts, debts, net_worth, total_assets, total_debt
-      - allocations (정기+sinking 월간 할당), total_allocated, spendable (자산 - 부채 - 할당)
+      - allocations (정기+sinking 월간 할당, sinking_fund 는 동적 commit 반영), total_allocated, spendable (자산 - 부채 - 할당)
       - goal (근거 포함)
       - pace_vs_goal: { months_left, remaining, needed_per_month, needed_per_month_source ('formula'|'override'), needed_per_month_formula, override_reason?, current_month_pl, projected_month_pl, month_on_track, month_shortfall, cumulative_on_track }
       - this_month_summary: { total_expense, total_income, total_card_payment, current_month_pl, by_category }
-      - month_forecast: { today, days_in_month, days_remaining, upcoming_recurring[], sinking_fund_monthly_commit, sinking_fund_annual_total, projected_outflow, projected_inflow, projected_month_end_pl, projected_month_end_net_worth, estimation_notes[] } — 이번 달 조회 시에만. 과거 달 조회 시 null.
+      - month_forecast: { today, days_in_month, days_remaining, upcoming_recurring[], recurring_missing_this_month[], recurring_processed_count, sinking_fund_monthly_commit, sinking_fund_annual_total, sinking_fund_breakdown[], projected_outflow, projected_inflow, projected_month_end_pl, projected_month_end_net_worth, estimation_notes[] } — 이번 달 조회 시에만. 과거 달 조회 시 null.
       - this_month_note: 이번 달 메모/오버라이드 (있을 때만 객체. note 또는 goal_override 포함)
       - month_notes_recent: 최근 6개월 메모 목록 (회고 추세 파악용)
+      - month_notes_meta: { limit, total, is_partial }
       - recurring (등록된 정기 항목 전체 — record_transaction 시 recurring_id 매칭에 사용)
       - pending (미해결 큐 — 반드시 사용자에게 알려 처리 유도)
-      - recent_transactions (최근 10건), voucher_balances ({바우처명: 잔액})
+      - pending_meta: { returned, total }
+      - recent_transactions (최근 10건), recent_transactions_meta: { limit, returned, total_this_month, is_partial, note }
+      - voucher_balances ({바우처명: 잔액})
+      - process_hints: { budget_pace, reconciliation_health, recent_activity, recurring_health } — 다음 액션 안내
       - nag (현재 상태에 대한 조언·경고를 1~3줄로 정리. nag_intensity 설정에 따라 강도 조절. 그대로 인용하거나 풀어 써도 됩니다. 오버라이드 적용 중이면 잊지 않게 라인이 들어갑니다.)
 
       month 인자로 다른 달 조회 가능 (생략 시 이번 달). 과거 달 조회 시 month_forecast 는 null.
